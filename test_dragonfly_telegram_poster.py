@@ -599,6 +599,30 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertIn('>#123</a>', calls[-1][1]['text'])
         self.assertNotIn('Открыть пост', calls[-1][1]['text'])
 
+    def test_media_fallback_does_not_dump_rendered_html(self):
+        calls = []
+        orig = poster.tg_request
+        orig_sleep = poster.time.sleep
+        def fake_tg_request(cfg, method, payload):
+            calls.append((method, payload))
+            if method in ('sendPhoto', 'sendAnimation', 'sendMediaGroup'):
+                raise RuntimeError('bad media')
+            return {'ok': True}
+        poster.tg_request = fake_tg_request
+        poster.time.sleep = lambda *_: None
+        rendered = '<div class="post-header"><img src="/x.jpg"><div class="post-footer">Мне нравится 1</div></div>'
+        try:
+            poster.send_post(cfg(), post(post_id=24974, description=rendered, photos=[{'url': '/bad.jpg'}]))
+        finally:
+            poster.tg_request = orig
+            poster.time.sleep = orig_sleep
+
+        body = calls[-1][1]['text']
+        self.assertIn('⚠️ Медиа не отправилось', body)
+        self.assertIn('>#24974</a>', body)
+        self.assertNotIn('post-header', body)
+        self.assertNotIn('&lt;div', body)
+
     def test_send_new_posts_records_telegram_message_mapping(self):
         con = poster.init_db(Path(':memory:'))
         c = cfg()

@@ -26,6 +26,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -1336,9 +1337,22 @@ def send_text_chunks(cfg: Config, chunks: list[str], *, start_at: int = 0) -> li
     return responses
 
 
+def clean_fallback_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    # Some Dragonfly feed rows can carry rendered HTML instead of plain post text.
+    # Never dump that layout markup into Telegram fallback messages.
+    html_markers = ("post-header", "post-footer", "post-photos-grid", "onclick=", "<div", "</div>", "<img")
+    tag_count = len(re.findall(r"</?[a-zA-Z][^>]*>", text))
+    if any(m in text for m in html_markers) or tag_count >= 3:
+        return ""
+    return text
+
+
 def send_media_fallback(cfg: Config, post: dict[str, Any], error: Exception) -> dict[str, Any]:
     fallback = dict(post)
-    original_text = (fallback.get("description") or "").strip()
+    original_text = clean_fallback_text(fallback.get("description"))
     warning = "⚠️ Медиа не отправилось, поэтому публикую текст и ссылку на оригинал."
     if original_text:
         fallback["description"] = warning + "\n\n" + original_text
