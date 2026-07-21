@@ -75,6 +75,32 @@ class CaptureTelegram:
 
 
 class DragonflyPosterTests(unittest.TestCase):
+    def test_configure_active_account_can_pin_named_account_without_rewriting_active(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'accounts.json'
+            data = {
+                'active': 'main',
+                'accounts': [
+                    {'name': 'main', 'access_token': 'tok-main', 'enabled': True},
+                    {'name': 'backup_2', 'access_token': 'tok-b2', 'enabled': True},
+                ],
+            }
+            path.write_text(json.dumps(data), encoding='utf-8')
+            c = cfg()
+            c.accounts_file = str(path)
+            c.account_name = 'backup_2'
+            c.cookie_file = '/tmp/cookies.txt'
+
+            poster.configure_active_account(c)
+
+            self.assertEqual(c.dragonfly_token, 'tok-b2')
+            self.assertEqual(c.account_name, 'backup_2')
+            self.assertTrue(c.account_pinned)
+            self.assertIsNone(c.cookie_file)
+            self.assertEqual(json.loads(path.read_text())['active'], 'main')
+            self.assertFalse(poster.switch_dragonfly_account(c, '401'))
+            self.assertEqual(json.loads(path.read_text())['active'], 'main')
+
     def test_api_get_json_retries_transient_urlerror(self):
         calls = {'n': 0}
         orig_urlopen = poster.urllib.request.urlopen

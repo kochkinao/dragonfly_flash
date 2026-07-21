@@ -215,6 +215,15 @@ python3 dragonfly_telegram_poster.py \
   sync-stats-watch --count 20 --interval 60
 ```
 
+Для read-only распределения нагрузки можно закрепить watcher за отдельным аккаунтом из `DRAGONFLY_ACCOUNTS_FILE`, не меняя глобальный `active`:
+
+```bash
+python3 dragonfly_telegram_poster.py \
+  --env-file /home/wacotal/dragonfly.env \
+  --dragonfly-account backup_1 \
+  sync-stats-watch --count 50 --interval 30
+```
+
 ## Telegram discussion group
 
 Если канал привязан к группе обсуждений, укажите её ID:
@@ -255,6 +264,15 @@ python3 dragonfly_telegram_poster.py \
 python3 dragonfly_telegram_poster.py \
   --env-file /home/wacotal/dragonfly.env \
   sync-comments-watch --count 20 --interval 30
+```
+
+Для отдельного read-only аккаунта и расширенного окна:
+
+```bash
+python3 dragonfly_telegram_poster.py \
+  --env-file /home/wacotal/dragonfly.env \
+  --dragonfly-account backup_2 \
+  sync-comments-watch --count 50 --interval 30 --send-existing
 ```
 
 Если нужно отправить уже существующие комментарии тоже, добавьте `--send-existing`.

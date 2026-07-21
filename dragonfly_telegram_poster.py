@@ -88,6 +88,7 @@ class Config:
     cookie_file: str | None
     accounts_file: str | None = None
     account_name: str | None = None
+    account_pinned: bool = False
 
 
 LOGGER = logging.getLogger("dragonfly_telegram_poster")
@@ -242,11 +243,16 @@ def configure_active_account(cfg: Config) -> None:
     accounts = _enabled_accounts(data)
     if not accounts:
         raise SystemExit("Dragonfly accounts file has no enabled accounts")
-    active_name = data.get("active")
-    account = next((a for a in accounts if a.get("name") == active_name), accounts[0])
+    requested_name = cfg.account_name
+    active_name = requested_name or data.get("active")
+    account = next((a for a in accounts if a.get("name") == active_name), None)
+    if account is None:
+        names = ", ".join(str(a.get("name")) for a in accounts)
+        raise SystemExit(f"Dragonfly account not found/enabled: {active_name}. Available: {names}")
     cfg.dragonfly_token = str(account["access_token"])
     cfg.cookie_file = None
     cfg.account_name = str(account.get("name") or account.get("sub") or "account")
+    cfg.account_pinned = bool(requested_name)
 
 
 def switch_dragonfly_account(cfg: Config, reason: str) -> bool:
@@ -255,7 +261,7 @@ def switch_dragonfly_account(cfg: Config, reason: str) -> bool:
     Returns True if switched, False when no replacement exists. This is only for
     auth failures such as 401, not for 429 rate limits.
     """
-    if not cfg.accounts_file:
+    if not cfg.accounts_file or cfg.account_pinned:
         return False
     data = load_accounts_file(cfg.accounts_file)
     if not data:
@@ -1987,7 +1993,7 @@ def cmd_sync_comments(cfg: Config, con: sqlite3.Connection, args: argparse.Names
 
 
 def cmd_sync_comments_watch(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
-    log(f"sync-comments-watch started interval={args.interval}s count={args.count} dry_run={cfg.dry_run}")
+    log(f"sync-comments-watch started interval={args.interval}s count={args.count} account={cfg.account_name or 'default'} dry_run={cfg.dry_run}")
     while True:
         try:
             cmd_sync_comments(cfg, con, args)
@@ -2018,7 +2024,7 @@ def cmd_sync_stats(cfg: Config, con: sqlite3.Connection, args: argparse.Namespac
 
 
 def cmd_sync_stats_watch(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
-    log(f"sync-stats-watch started interval={args.interval}s count={args.count} dry_run={cfg.dry_run}")
+    log(f"sync-stats-watch started interval={args.interval}s count={args.count} account={cfg.account_name or 'default'} dry_run={cfg.dry_run}")
     while True:
         try:
             cmd_sync_stats(cfg, con, args)
@@ -2059,6 +2065,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dragonfly-user-id", default=None, help="Dragonfly user id for /api/get_comments; env DRAGONFLY_USER_ID also works")
     p.add_argument("--cookie-file", default=None, help="Dragonfly Mozilla/Netscape cookie jar; env DRAGONFLY_COOKIE_FILE also works. Preferred over legacy JWT.")
     p.add_argument("--accounts-file", default=None, help="JSON file with Dragonfly account tokens for 401/auth failover; env DRAGONFLY_ACCOUNTS_FILE also works.")
+    p.add_argument("--dragonfly-account", default=None, help="pin this process to a named Dragonfly account from --accounts-file; does not rewrite active account")
 
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("auth-check", help="check Dragonfly authentication and exit")
@@ -2126,6 +2133,7 @@ def main() -> int:
         discussion_chat_id=args.discussion_chat_id or optional_env("TELEGRAM_DISCUSSION_CHAT_ID"),
         cookie_file=args.cookie_file or optional_env("DRAGONFLY_COOKIE_FILE"),
         accounts_file=args.accounts_file or optional_env("DRAGONFLY_ACCOUNTS_FILE"),
+        account_name=args.dragonfly_account or None,
     )
     configure_active_account(cfg)
     if not cfg.cookie_file and not cfg.dragonfly_token:
