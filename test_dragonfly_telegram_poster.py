@@ -618,9 +618,20 @@ class DragonflyPosterTests(unittest.TestCase):
             poster.time.sleep = orig_sleep
 
         self.assertEqual(n, 1)
-        row = con.execute("SELECT message_id, message_kind, last_likes, last_comments FROM telegram_messages WHERE post_id=888").fetchone()
+        row = con.execute("SELECT message_id, message_kind, last_likes, last_comments FROM telegram_messages WHERE post_id=888 AND role='main'").fetchone()
         self.assertEqual(row, (4242, 'text', 2, 1))
         self.assertEqual(calls[0][0], 'sendMessage')
+        self.assertIn('❤️ 2', calls[0][1]['text'])
+        self.assertIn('💬 1', calls[0][1]['text'])
+        stored = con.execute("SELECT base_html FROM telegram_messages WHERE post_id=888 AND role='main'").fetchone()[0]
+        self.assertNotIn('❤️ 2', stored)
+
+    def test_initial_zero_stats_footer_is_sent(self):
+        with CaptureTelegram() as calls:
+            poster.send_post(cfg(), post(description='hello', likes_count=0, comments_count=0))
+
+        self.assertIn('❤️ 0', calls[0][1]['text'])
+        self.assertIn('💬 0', calls[0][1]['text'])
 
     def test_sync_post_stats_edits_text_when_counts_change(self):
         con = poster.init_db(Path(':memory:'))

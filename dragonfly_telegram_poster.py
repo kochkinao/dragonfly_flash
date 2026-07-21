@@ -468,6 +468,22 @@ def format_chunks_for_send(post: dict[str, Any], *, limit: int) -> list[str]:
     return format_html_chunks(post, limit=safe_limit)
 
 
+def chunks_with_initial_stats(post: dict[str, Any], chunks: list[str], *, limit: int) -> list[str]:
+    """Add current ❤️/💬 footer to the first/main Telegram chunk on initial send.
+
+    The database still stores the base chunk without footer, so later stats edits
+    can rebuild the footer cleanly instead of stacking duplicate lines.
+    """
+    if not chunks:
+        return chunks
+    likes, comments = extract_post_stats(post)
+    first = append_stats_footer(chunks[0], likes, comments, limit=limit)
+    if first is None:
+        log(f"initial stats footer skipped for post #{post.get('post_id')}: Telegram limit={limit}", logging.WARNING)
+        return chunks
+    return [first, *chunks[1:]]
+
+
 def record_telegram_message(
     con: sqlite3.Connection,
     post: dict[str, Any],
@@ -1230,8 +1246,9 @@ def send_post(cfg: Config, post: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     if not photos:
-        chunks = format_chunks_for_send(post, limit=MAX_TG_MESSAGE)
-        responses = send_text_chunks(cfg, chunks)
+        base_chunks = format_chunks_for_send(post, limit=MAX_TG_MESSAGE)
+        send_chunks = chunks_with_initial_stats(post, base_chunks, limit=MAX_TG_MESSAGE)
+        responses = send_text_chunks(cfg, send_chunks)
         main_resp = responses[0] if responses else {}
         last_resp = responses[-1] if responses else {}
         log(f"sent text post #{pid}")
@@ -1239,31 +1256,33 @@ def send_post(cfg: Config, post: dict[str, Any]) -> dict[str, Any] | None:
             "main": {
                 "message_kind": "text",
                 "message_id": _message_id_from_tg_response(main_resp),
-                "base_html": chunks[0] if chunks else "",
+                "base_html": base_chunks[0] if base_chunks else "",
             },
             "last": {
                 "message_kind": "text",
                 "message_id": _last_message_id_from_tg_response(last_resp),
-                "base_html": chunks[-1] if chunks else "",
+                "base_html": base_chunks[-1] if base_chunks else "",
             },
         }
 
-    chunks = format_chunks_for_send(post, limit=MAX_TG_CAPTION)
-    caption = chunks[0]
+    base_chunks = format_chunks_for_send(post, limit=MAX_TG_CAPTION)
+    send_chunks = chunks_with_initial_stats(post, base_chunks, limit=MAX_TG_CAPTION)
+    caption = send_chunks[0]
+    base_caption = base_chunks[0]
 
     try:
         if len(photos) == 1:
             media_resp = send_one_media(cfg, photos[0], caption=caption)
-            text_responses = send_text_chunks(cfg, chunks, start_at=1)
+            text_responses = send_text_chunks(cfg, send_chunks, start_at=1)
             last_is_text = bool(text_responses)
             last_resp = text_responses[-1] if text_responses else media_resp
             log(f"sent {'animation' if is_gif_url(photos[0]) else 'photo'} post #{pid}")
             return {
-                "main": {"message_kind": "caption", "message_id": _message_id_from_tg_response(media_resp), "base_html": caption},
+                "main": {"message_kind": "caption", "message_id": _message_id_from_tg_response(media_resp), "base_html": base_caption},
                 "last": {
                     "message_kind": "text" if last_is_text else "caption",
                     "message_id": _last_message_id_from_tg_response(last_resp),
-                    "base_html": chunks[-1] if last_is_text else caption,
+                    "base_html": base_chunks[-1] if last_is_text else base_caption,
                 },
             }
 
@@ -1279,23 +1298,23 @@ def send_post(cfg: Config, post: dict[str, Any]) -> dict[str, Any] | None:
                 last_media_resp = resp
                 if cfg.media_item_delay > 0:
                     time.sleep(cfg.media_item_delay)
-            text_responses = send_text_chunks(cfg, chunks, start_at=1)
+            text_responses = send_text_chunks(cfg, send_chunks, start_at=1)
             last_is_text = bool(text_responses)
             last_resp = text_responses[-1] if text_responses else (last_media_resp or first_resp or {})
             log(f"sent mixed media post #{pid} media={len(photos)}")
             return {
-                "main": {"message_kind": "caption", "message_id": _message_id_from_tg_response(first_resp or {}), "base_html": caption},
+                "main": {"message_kind": "caption", "message_id": _message_id_from_tg_response(first_resp or {}), "base_html": base_caption},
                 "last": {
                     "message_kind": "text" if last_is_text else "caption",
                     "message_id": _last_message_id_from_tg_response(last_resp),
-                    "base_html": chunks[-1] if last_is_text else caption,
+                    "base_html": base_chunks[-1] if last_is_text else base_caption,
                 },
             }
 
         # Telegram mediaGroup: max 10 items, caption only on the first item of the
         # first album. Additional albums carry only media; text continues below.
         media_responses = send_photo_groups(cfg, photos, caption=caption)
-        text_responses = send_text_chunks(cfg, chunks, start_at=1)
+        text_responses = send_text_chunks(cfg, send_chunks, start_at=1)
         last_is_text = bool(text_responses)
         last_resp = text_responses[-1] if text_responses else (media_responses[0] if media_responses else {})
         log(f"sent album post #{pid} photos={len(photos)}")
@@ -1303,12 +1322,12 @@ def send_post(cfg: Config, post: dict[str, Any]) -> dict[str, Any] | None:
             "main": {
                 "message_kind": "caption",
                 "message_id": _message_id_from_tg_response(media_responses[0]) if media_responses else None,
-                "base_html": caption,
+                "base_html": base_caption,
             },
             "last": {
                 "message_kind": "text" if last_is_text else "caption",
                 "message_id": _last_message_id_from_tg_response(last_resp),
-                "base_html": chunks[-1] if last_is_text else caption,
+                "base_html": base_chunks[-1] if last_is_text else base_caption,
             },
         }
     except Exception as e:
