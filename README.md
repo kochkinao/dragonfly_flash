@@ -224,6 +224,8 @@ python3 dragonfly_telegram_poster.py \
   sync-stats-watch --count 50 --interval 30
 ```
 
+`--offset` позволяет шардировать окна между несколькими read-only watcher'ами без пересечения.
+
 ## Telegram discussion group
 
 Если канал привязан к группе обсуждений, укажите её ID:

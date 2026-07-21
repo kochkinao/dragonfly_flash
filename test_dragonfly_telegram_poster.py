@@ -101,6 +101,22 @@ class DragonflyPosterTests(unittest.TestCase):
             self.assertFalse(poster.switch_dragonfly_account(c, '401'))
             self.assertEqual(json.loads(path.read_text())['active'], 'main')
 
+    def test_fetch_recent_posts_honors_start_offset(self):
+        c = cfg()
+        c.limit = 10
+        seen_offsets = []
+        orig = poster.fetch_feed_page
+        def fake_page(cfg, offset):
+            seen_offsets.append(offset)
+            return [post(post_id=1000 - offset - i) for i in range(10)]
+        poster.fetch_feed_page = fake_page
+        try:
+            rows = poster.fetch_recent_posts(c, 12, start_offset=20)
+        finally:
+            poster.fetch_feed_page = orig
+        self.assertEqual(seen_offsets, [20, 30])
+        self.assertEqual(len(rows), 12)
+
     def test_api_get_json_retries_transient_urlerror(self):
         calls = {'n': 0}
         orig_urlopen = poster.urllib.request.urlopen

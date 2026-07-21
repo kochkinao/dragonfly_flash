@@ -930,11 +930,11 @@ def fetch_post_by_id(cfg: Config, post_id: int) -> dict[str, Any] | None:
     return None
 
 
-def fetch_recent_posts(cfg: Config, count: int) -> list[dict[str, Any]]:
+def fetch_recent_posts(cfg: Config, count: int, *, start_offset: int = 0) -> list[dict[str, Any]]:
     """Fetch up to count posts using offset pagination. Returns newest-first from API order."""
     posts: list[dict[str, Any]] = []
     seen: set[int] = set()
-    offset = 0
+    offset = max(0, int(start_offset))
     while len(posts) < count:
         page = fetch_feed_page(cfg, offset)
         if not page:
@@ -1974,7 +1974,7 @@ def cmd_sync_comments(cfg: Config, con: sqlite3.Connection, args: argparse.Names
     old_limit = cfg.limit
     cfg.limit = int(args.count)
     try:
-        posts = fetch_recent_posts(cfg, int(args.count))
+        posts = fetch_recent_posts(cfg, int(args.count), start_offset=int(getattr(args, "offset", 0)))
     finally:
         cfg.limit = old_limit
     total_sent = 0
@@ -1993,7 +1993,7 @@ def cmd_sync_comments(cfg: Config, con: sqlite3.Connection, args: argparse.Names
 
 
 def cmd_sync_comments_watch(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
-    log(f"sync-comments-watch started interval={args.interval}s count={args.count} account={cfg.account_name or 'default'} dry_run={cfg.dry_run}")
+    log(f"sync-comments-watch started interval={args.interval}s count={args.count} offset={getattr(args, 'offset', 0)} account={cfg.account_name or 'default'} dry_run={cfg.dry_run}")
     while True:
         try:
             cmd_sync_comments(cfg, con, args)
@@ -2007,7 +2007,7 @@ def cmd_sync_stats(cfg: Config, con: sqlite3.Connection, args: argparse.Namespac
     old_limit = cfg.limit
     cfg.limit = int(args.count)
     try:
-        posts = fetch_recent_posts(cfg, int(args.count))
+        posts = fetch_recent_posts(cfg, int(args.count), start_offset=int(getattr(args, "offset", 0)))
     finally:
         cfg.limit = old_limit
     updated = 0
@@ -2024,7 +2024,7 @@ def cmd_sync_stats(cfg: Config, con: sqlite3.Connection, args: argparse.Namespac
 
 
 def cmd_sync_stats_watch(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
-    log(f"sync-stats-watch started interval={args.interval}s count={args.count} account={cfg.account_name or 'default'} dry_run={cfg.dry_run}")
+    log(f"sync-stats-watch started interval={args.interval}s count={args.count} offset={getattr(args, 'offset', 0)} account={cfg.account_name or 'default'} dry_run={cfg.dry_run}")
     while True:
         try:
             cmd_sync_stats(cfg, con, args)
@@ -2086,18 +2086,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("sync-stats", help="one-shot sync of likes/comments for recent posts already mapped to Telegram")
     s.add_argument("--count", type=int, default=20, help="recent Dragonfly posts to inspect")
+    s.add_argument("--offset", type=int, default=0, help="Dragonfly feed offset; useful for sharding read-only watchers")
 
     s = sub.add_parser("sync-stats-watch", help="poll likes/comments and edit Telegram posts forever")
     s.add_argument("--count", type=int, default=20, help="recent Dragonfly posts to inspect per tick")
     s.add_argument("--interval", type=float, default=60.0, help="seconds between stats sync ticks")
+    s.add_argument("--offset", type=int, default=0, help="Dragonfly feed offset; useful for sharding read-only watchers")
 
     s = sub.add_parser("sync-comments", help="one-shot mirror of new Dragonfly comments into Telegram discussion")
     s.add_argument("--count", type=int, default=20, help="recent Dragonfly posts to inspect")
+    s.add_argument("--offset", type=int, default=0, help="Dragonfly feed offset; useful for sharding read-only watchers")
     s.add_argument("--send-existing", action="store_true", help="send already existing comments too; default seeds existing comments silently on first observation")
 
     s = sub.add_parser("sync-comments-watch", help="poll Dragonfly comments and mirror new ones forever")
     s.add_argument("--count", type=int, default=20, help="recent Dragonfly posts to inspect per tick")
     s.add_argument("--interval", type=float, default=30.0, help="seconds between comment sync ticks")
+    s.add_argument("--offset", type=int, default=0, help="Dragonfly feed offset; useful for sharding read-only watchers")
     s.add_argument("--send-existing", action="store_true", help="send already existing comments too; default seeds existing comments silently on first observation")
     return p
 
