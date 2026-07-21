@@ -1,0 +1,1 @@
+# stdlib-only project; no third-party runtime dependencies

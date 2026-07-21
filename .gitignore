@@ -1,0 +1,27 @@
+# Secrets / local config
+dragonfly.env
+.env
+*.env
+!dragonfly.env.example
+
+# Runtime state
+*.sqlite3
+*.db
+*.db-*
+*.log
+*.pid
+*.state
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,559 @@
+import importlib.util
+import io
+import sys
+import unittest
+import urllib.error
+from pathlib import Path
+
+SCRIPT = Path('/home/wacotal/dragonfly_telegram_poster.py')
+spec = importlib.util.spec_from_file_location('poster', SCRIPT)
+poster = importlib.util.module_from_spec(spec)
+sys.modules['poster'] = poster
+spec.loader.exec_module(poster)
+
+
+def cfg():
+    return poster.Config(
+        dragonfly_token='df',
+        telegram_token=None,
+        telegram_chat_id='@channel',
+        db_path=Path(':memory:'),
+        dry_run=True,
+        feed_type='all',
+        request_delay=0,
+        send_delay=0,
+        text_delay=0,
+        photo_delay=0,
+        album_delay=0,
+        animation_delay=0,
+        mixed_media_delay=0,
+        media_item_delay=0,
+        poll_interval=15,
+        limit=20,
+        max_attempts=poster.DEFAULT_MAX_ATTEMPTS,
+        keep_sent=poster.DEFAULT_KEEP_SENT,
+        log_file=None,
+        upload_media=False,
+        alert_chat_id=None,
+        cookie_file=None,
+    )
+
+
+def post(**overrides):
+    base = {
+        'post_id': 123,
+        'author_name': 'Alice <A>',
+        'author_link': 'alice_profile',
+        'created_at': '2026-07-20T08:00:00',
+        'description': 'hello',
+        'photos': [],
+        'audios': [],
+        'is_repost': False,
+    }
+    base.update(overrides)
+    return base
+
+
+class CaptureTelegram:
+    def __enter__(self):
+        self.calls = []
+        self.orig_tg_request = poster.tg_request
+        self.orig_sleep = poster.time.sleep
+        def fake_tg_request(cfg, method, payload):
+            self.calls.append((method, payload))
+            return {'ok': True}
+        poster.tg_request = fake_tg_request
+        poster.time.sleep = lambda *_: None
+        return self.calls
+    def __exit__(self, *exc):
+        poster.tg_request = self.orig_tg_request
+        poster.time.sleep = self.orig_sleep
+
+
+class DragonflyPosterTests(unittest.TestCase):
+    def test_api_get_json_retries_transient_urlerror(self):
+        calls = {'n': 0}
+        orig_urlopen = poster.urllib.request.urlopen
+        orig_sleep = poster.time.sleep
+
+        class Resp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+            def read(self):
+                return b'{"ok": true}'
+
+        def fake_urlopen(req, timeout):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise urllib.error.URLError('ssl eof')
+            return Resp()
+
+        poster.urllib.request.urlopen = fake_urlopen
+        poster.time.sleep = lambda *_: None
+        try:
+            data = poster.api_get_json('https://example.test/api', {}, retries=1)
+        finally:
+            poster.urllib.request.urlopen = orig_urlopen
+            poster.time.sleep = orig_sleep
+
+        self.assertEqual(data, {'ok': True})
+        self.assertEqual(calls['n'], 2)
+
+    def test_api_get_json_retries_http_429_with_longer_sleep(self):
+        calls = {'n': 0}
+        sleeps = []
+        orig_urlopen = poster.urllib.request.urlopen
+        orig_sleep = poster.time.sleep
+
+        class Resp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+            def read(self):
+                return b'{"ok": true}'
+
+        def fake_urlopen(req, timeout):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise urllib.error.HTTPError(
+                    req.full_url,
+                    429,
+                    'Too Many Requests',
+                    {},
+                    io.BytesIO(b'too many'),
+                )
+            return Resp()
+
+        poster.urllib.request.urlopen = fake_urlopen
+        poster.time.sleep = lambda s: sleeps.append(s)
+        try:
+            data = poster.api_get_json('https://example.test/api', {}, retries=1)
+        finally:
+            poster.urllib.request.urlopen = orig_urlopen
+            poster.time.sleep = orig_sleep
+
+        self.assertEqual(data, {'ok': True})
+        self.assertEqual(calls['n'], 2)
+        self.assertEqual(sleeps[0], poster.DEFAULT_API_429_BASE_SLEEP)
+
+    def test_api_get_json_uses_adaptive_429_backoff(self):
+        calls = {'n': 0}
+        sleeps = []
+        alerts = []
+        orig_urlopen = poster.urllib.request.urlopen
+        orig_sleep = poster.time.sleep
+
+        class Resp:
+            def __enter__(self): return self
+            def __exit__(self, *exc): return False
+            def read(self): return b'{"ok": true}'
+
+        def fake_urlopen(req, timeout):
+            calls['n'] += 1
+            if calls['n'] <= 3:
+                raise urllib.error.HTTPError(req.full_url, 429, 'Too Many Requests', {}, io.BytesIO(b'too many'))
+            return Resp()
+
+        poster.urllib.request.urlopen = fake_urlopen
+        poster.time.sleep = lambda s: sleeps.append(s)
+        try:
+            data = poster.api_get_json('https://example.test/api', {}, retries=3, alert=alerts.append)
+        finally:
+            poster.urllib.request.urlopen = orig_urlopen
+            poster.time.sleep = orig_sleep
+
+        self.assertEqual(data, {'ok': True})
+        self.assertEqual(sleeps, [30.0, 60.0, 120.0])
+        self.assertIn('жду 30 сек', alerts[0])
+        self.assertIn('жду 1 мин', alerts[1])
+        self.assertIn('жду 2 мин', alerts[2])
+
+    def test_api_get_json_sends_friendly_429_alert_callback(self):
+        calls = {'n': 0}
+        alerts = []
+        orig_urlopen = poster.urllib.request.urlopen
+        orig_sleep = poster.time.sleep
+
+        class Resp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+            def read(self):
+                return b'{"ok": true}'
+
+        def fake_urlopen(req, timeout):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise urllib.error.HTTPError(req.full_url, 429, 'Too Many Requests', {}, io.BytesIO(b'too many'))
+            return Resp()
+
+        poster.urllib.request.urlopen = fake_urlopen
+        poster.time.sleep = lambda *_: None
+        try:
+            poster.api_get_json('https://example.test/api/feed?type=all&limit=20&offset=120', {}, retries=1, alert=alerts.append)
+        finally:
+            poster.urllib.request.urlopen = orig_urlopen
+            poster.time.sleep = orig_sleep
+
+        self.assertEqual(len(alerts), 1)
+        self.assertIn('429', alerts[0])
+        self.assertIn('жду 30 сек', alerts[0])
+        self.assertIn('попытка 1/1', alerts[0])
+
+    def test_dragonfly_headers_use_bearer_without_cookie_file(self):
+        c = cfg()
+        c.dragonfly_token = 'jwt-token'
+        c.cookie_file = None
+
+        headers = poster.dragonfly_headers(c)
+
+        self.assertEqual(headers['Authorization'], 'Bearer jwt-token')
+        self.assertIn('User-Agent', headers)
+
+    def test_dragonfly_headers_omit_bearer_when_cookie_file_exists(self):
+        c = cfg()
+        c.dragonfly_token = 'jwt-token'
+        c.cookie_file = '/tmp/dragonfly-cookies.txt'
+
+        headers = poster.dragonfly_headers(c)
+
+        self.assertNotIn('Authorization', headers)
+        self.assertEqual(headers['Accept'], 'application/json')
+
+    def test_api_get_json_sends_friendly_401_alert_before_raising(self):
+        alerts = []
+        orig_urlopen = poster.urllib.request.urlopen
+
+        def fake_urlopen(req, timeout):
+            raise urllib.error.HTTPError(req.full_url, 401, 'Unauthorized', {}, io.BytesIO(b'{"detail":"expired"}'))
+
+        poster.urllib.request.urlopen = fake_urlopen
+        try:
+            with self.assertRaises(RuntimeError):
+                poster.api_get_json('https://example.test/api/feed', {}, retries=0, auth_alert=alerts.append)
+        finally:
+            poster.urllib.request.urlopen = orig_urlopen
+
+        self.assertEqual(len(alerts), 1)
+        self.assertIn('Авторизация Dragonfly истекла', alerts[0])
+        self.assertIn('401', alerts[0])
+
+    def test_cmd_auth_check_returns_zero_when_feed_page_loads(self):
+        c = cfg()
+        calls = []
+        orig = poster.fetch_feed_page
+        poster.fetch_feed_page = lambda cfg, offset: calls.append(offset) or [post(post_id=1)]
+        try:
+            rc = poster.cmd_auth_check(c)
+        finally:
+            poster.fetch_feed_page = orig
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [0])
+
+    def test_send_alert_uses_alert_chat_id_and_html(self):
+        c = cfg()
+        c.telegram_token = 'bot-token'
+        c.alert_chat_id = '123456789'
+        calls = []
+        orig = poster.tg_request
+        poster.tg_request = lambda cfg, method, payload: calls.append((method, payload)) or {'ok': True}
+        try:
+            poster.send_alert(c, '⚠️ Тест', 'получили <429> & ждём')
+        finally:
+            poster.tg_request = orig
+
+        self.assertEqual(calls[0][0], 'sendMessage')
+        self.assertEqual(calls[0][1]['chat_id'], '123456789')
+        self.assertIn('⚠️ Тест', calls[0][1]['text'])
+        self.assertIn('&lt;429&gt; &amp;', calls[0][1]['text'])
+
+    def test_download_media_retries_transient_urlerror(self):
+        calls = {'n': 0}
+        sleeps = []
+        orig_urlopen = poster.urllib.request.urlopen
+        orig_sleep = poster.time.sleep
+
+        class Resp:
+            headers = {'content-type': 'image/jpeg', 'content-length': '4'}
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+            def read(self, n=-1):
+                return b'JPEG'
+
+        def fake_urlopen(req, timeout):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise urllib.error.URLError('ssl eof')
+            return Resp()
+
+        poster.urllib.request.urlopen = fake_urlopen
+        poster.time.sleep = lambda s: sleeps.append(s)
+        try:
+            filename, data, ctype = poster.download_media_bytes('https://dragonfly-flash.ru/photousers/x.jpg', retries=1)
+        finally:
+            poster.urllib.request.urlopen = orig_urlopen
+            poster.time.sleep = orig_sleep
+
+        self.assertEqual(filename, 'x.jpg')
+        self.assertEqual(data, b'JPEG')
+        self.assertEqual(ctype, 'image/jpeg')
+        self.assertEqual(calls['n'], 2)
+        self.assertTrue(sleeps)
+
+    def test_header_has_linked_author_and_datetime_with_light_emoji(self):
+        chunks = poster.format_html_chunks(post(description='hello'), limit=poster.MAX_TG_MESSAGE)
+
+        self.assertIn('👤 <a href="https://dragonfly-flash.ru/?id=alice_profile">Alice &lt;A&gt;</a>', chunks[0])
+        self.assertIn('🕒 <i>20.07.2026 12:00</i>', chunks[0])
+
+    def test_text_keeps_apostrophes_and_combining_symbols_but_escapes_html(self):
+        chunks = poster.format_html_chunks(post(description="Брад (ง'̀-'́)ง <script>&"), limit=poster.MAX_TG_MESSAGE)
+        text = chunks[0]
+
+        self.assertIn("(ง'̀-'́)ง", text)
+        self.assertNotIn('&#x27;', text)
+        self.assertIn('&lt;script&gt;&amp;', text)
+
+    def test_text_decodes_existing_html_entities_before_safe_escape(self):
+        chunks = poster.format_html_chunks(post(description="Брад (ง&#x27;̀-&#x27;́)ง &lt;b&gt;"), limit=poster.MAX_TG_MESSAGE)
+        text = chunks[0]
+
+        self.assertIn("(ง'̀-'́)ง", text)
+        self.assertNotIn('&#x27;', text)
+        self.assertIn('&lt;b&gt;', text)
+
+    def test_log_file_receives_timestamped_lines(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            path = f.name
+        poster.setup_logging(path)
+        try:
+            poster.log('hello log file')
+            text = Path(path).read_text(encoding='utf-8')
+        finally:
+            poster.setup_logging(None)
+        self.assertIn('hello log file', text)
+        self.assertIn('INFO', text)
+
+    def test_empty_post_without_text_or_media_is_not_publishable(self):
+        self.assertFalse(poster.is_publishable(post(description='   ', photos=[])))
+        self.assertTrue(poster.is_publishable(post(description='text', photos=[])))
+        self.assertTrue(poster.is_publishable(post(description='   ', photos=[{'url': '/x.jpg'}])))
+
+    def test_audio_only_post_is_publishable_as_track_info(self):
+        p = post(description='', photos=[], audios=[{'artist': 'Импакт', 'title': 'Социопат', 'file_path': 'audio.mp3'}])
+
+        self.assertTrue(poster.is_publishable(p))
+        chunks = poster.format_html_chunks(p, limit=poster.MAX_TG_MESSAGE)
+        self.assertIn('🎵 <b>Трек:</b> Импакт — Социопат', '\n'.join(chunks))
+
+    def test_long_text_post_is_split_into_bounded_messages_with_continuation(self):
+        long_text = 'абвгд ' * 900
+        with CaptureTelegram() as calls:
+            poster.send_post(cfg(), post(description=long_text, photos=[]))
+
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertTrue(all(method == 'sendMessage' for method, _ in calls))
+        self.assertTrue(all(len(payload['text']) <= poster.MAX_TG_MESSAGE for _, payload in calls))
+        self.assertIn('(1/', calls[0][1]['text'])
+        self.assertIn('(2/', calls[1][1]['text'])
+        self.assertIn('>#123</a>', calls[-1][1]['text'])
+        self.assertNotIn('Открыть пост', calls[-1][1]['text'])
+
+    def test_long_media_caption_is_split_caption_then_followup_messages(self):
+        long_text = 'длинный текст ' * 240
+        with CaptureTelegram() as calls:
+            poster.send_post(cfg(), post(description=long_text, photos=[{'url': '/p.jpg'}]))
+
+        self.assertEqual(calls[0][0], 'sendPhoto')
+        self.assertLessEqual(len(calls[0][1]['caption']), poster.MAX_TG_CAPTION)
+        self.assertIn('(1/', calls[0][1]['caption'])
+        self.assertGreaterEqual(len(calls), 2)
+        for _method, payload in calls:
+            body = payload.get('text', payload.get('caption', ''))
+            limit = poster.MAX_TG_CAPTION if 'caption' in payload else poster.MAX_TG_MESSAGE
+            self.assertLessEqual(len(body), limit)
+        self.assertEqual(calls[-1][0], 'sendMessage')
+        self.assertIn('>#123</a>', calls[-1][1]['text'])
+        self.assertNotIn('Открыть пост', calls[-1][1]['text'])
+
+    def test_photo_count_is_not_rendered_in_caption(self):
+        text = poster.format_html_chunks(post(description='hello', photos=[{'url': '/p.jpg'}]), limit=poster.MAX_TG_CAPTION)[0]
+
+        self.assertNotIn('📷 1', text)
+
+    def test_audio_info_is_rendered_and_counted_inside_caption_limit(self):
+        p = post(
+            description='hello ' * 220,
+            photos=[{'url': '/p.jpg'}],
+            audios=[{
+                'artist': 'Massive Attack',
+                'title': 'Angel',
+                'duration': 379,
+                'file_path': 'music/massive_attack_angel.mp3',
+            }],
+        )
+
+        chunks = poster.format_html_chunks(p, limit=poster.MAX_TG_CAPTION)
+
+        self.assertTrue(all(len(c) <= poster.MAX_TG_CAPTION for c in chunks))
+        joined = '\n'.join(chunks)
+        self.assertIn('🎵', joined)
+        self.assertIn('Massive Attack — Angel', joined)
+        self.assertIn('6:19', joined)
+        self.assertNotIn('massive_attack_angel.mp3', joined)
+        self.assertNotIn('audio_', joined)
+
+    def test_dry_run_does_not_mark_posts_sent(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = True
+        with CaptureTelegram():
+            processed = poster.send_new_posts(c, con, [post(post_id=555, description='hello')])
+
+        self.assertEqual(processed, 1)
+        self.assertFalse(poster.is_sent(con, 555))
+
+    def test_post_delay_depends_on_post_media_type(self):
+        c = cfg()
+        c.text_delay = 1
+        c.photo_delay = 2
+        c.album_delay = 3
+        c.animation_delay = 4
+        c.mixed_media_delay = 5
+
+        self.assertEqual(poster.delay_for_post(c, post(description='text', photos=[])), 1)
+        self.assertEqual(poster.delay_for_post(c, post(photos=[{'url': '/x.jpg'}])), 2)
+        self.assertEqual(poster.delay_for_post(c, post(photos=[{'url': '/1.jpg'}, {'url': '/2.jpg'}])), 3)
+        self.assertEqual(poster.delay_for_post(c, post(photos=[{'url': '/x.gif'}])), 4)
+        self.assertEqual(poster.delay_for_post(c, post(photos=[{'url': '/x.gif'}, {'url': '/y.jpg'}])), 5)
+
+    def test_send_new_posts_uses_type_specific_delay(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        c.text_delay = 1
+        c.photo_delay = 2
+        c.animation_delay = 4
+        sleeps = []
+        sent = []
+        orig_send = poster.send_post
+        orig_sleep = poster.time.sleep
+
+        def fake_send(cfg, p):
+            sent.append(int(p['post_id']))
+
+        poster.send_post = fake_send
+        poster.time.sleep = lambda s: sleeps.append(s)
+        try:
+            processed = poster.send_new_posts(c, con, [
+                post(post_id=3, description='gif', photos=[{'url': '/x.gif'}]),
+                post(post_id=2, description='photo', photos=[{'url': '/x.jpg'}]),
+                post(post_id=1, description='text', photos=[]),
+            ])
+        finally:
+            poster.send_post = orig_send
+            poster.time.sleep = orig_sleep
+
+        self.assertEqual(processed, 3)
+        self.assertEqual(sent, [1, 2, 3])
+        self.assertEqual(sleeps, [1, 2, 4])
+
+    def test_catch_up_gaps_fetches_missing_id_and_sends_existing_post(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        seen_fetches = []
+        sent = []
+        orig_fetch = poster.fetch_post_by_id
+        orig_send = poster.send_post
+        orig_sleep = poster.time.sleep
+
+        def fake_fetch(cfg, pid):
+            seen_fetches.append(pid)
+            return post(post_id=pid, description=f'missing {pid}') if pid == 102 else None
+
+        def fake_send(cfg, p):
+            sent.append(int(p['post_id']))
+
+        poster.fetch_post_by_id = fake_fetch
+        poster.send_post = fake_send
+        poster.time.sleep = lambda *_: None
+        try:
+            processed = poster.catch_up_missing_ids(c, con, min_id=100, max_id=104, known_ids={100, 101, 103, 104})
+        finally:
+            poster.fetch_post_by_id = orig_fetch
+            poster.send_post = orig_send
+            poster.time.sleep = orig_sleep
+
+        self.assertEqual(seen_fetches, [102])
+        self.assertEqual(sent, [102])
+        self.assertEqual(processed, 1)
+        self.assertTrue(poster.is_sent(con, 102))
+
+    def test_media_failure_falls_back_to_text_with_original_link(self):
+        calls = []
+        orig = poster.tg_request
+        orig_sleep = poster.time.sleep
+        def fake_tg_request(cfg, method, payload):
+            calls.append((method, payload))
+            if method in ('sendPhoto', 'sendAnimation', 'sendMediaGroup'):
+                raise RuntimeError('bad media')
+            return {'ok': True}
+        poster.tg_request = fake_tg_request
+        poster.time.sleep = lambda *_: None
+        try:
+            poster.send_post(cfg(), post(description='text', photos=[{'url': '/bad.jpg'}]))
+        finally:
+            poster.tg_request = orig
+            poster.time.sleep = orig_sleep
+
+        self.assertEqual(calls[-1][0], 'sendMessage')
+        self.assertIn('⚠️ Медиа не отправилось', calls[-1][1]['text'])
+        self.assertIn('>#123</a>', calls[-1][1]['text'])
+        self.assertNotIn('Открыть пост', calls[-1][1]['text'])
+
+    def test_failed_posts_stop_after_attempt_limit(self):
+        con = poster.init_db(Path(':memory:'))
+        p = post(post_id=777, description='text')
+        for _ in range(poster.DEFAULT_MAX_ATTEMPTS):
+            poster.mark_failed(con, p, 'boom')
+
+        self.assertTrue(poster.is_exhausted(con, 777, poster.DEFAULT_MAX_ATTEMPTS))
+
+    def test_cleanup_keeps_recent_sent_and_preserves_failed(self):
+        con = poster.init_db(Path(':memory:'))
+        for pid in range(1, 8):
+            poster.mark_sent(con, post(post_id=pid))
+        poster.mark_failed(con, post(post_id=99), 'boom')
+
+        deleted = poster.cleanup_sent(con, keep_sent=3)
+
+        self.assertEqual(deleted, 4)
+        remaining_sent = [r[0] for r in con.execute("select post_id from sent_posts where status='sent' order by post_id").fetchall()]
+        self.assertEqual(remaining_sent, [5, 6, 7])
+        failed = con.execute("select post_id from sent_posts where status='failed'").fetchall()
+        self.assertEqual(failed, [(99,)])
+
+    def test_more_than_ten_photos_are_sent_as_multiple_media_groups(self):
+        photos = [{'url': f'/p{i}.jpg'} for i in range(23)]
+        with CaptureTelegram() as calls:
+            poster.send_post(cfg(), post(description='album', photos=photos))
+
+        groups = [payload for method, payload in calls if method == 'sendMediaGroup']
+        self.assertEqual([len(g['media']) for g in groups], [10, 10, 3])
+        self.assertIn('caption', groups[0]['media'][0])
+        for g in groups[1:]:
+            for item in g['media']:
+                self.assertNotIn('caption', item)
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

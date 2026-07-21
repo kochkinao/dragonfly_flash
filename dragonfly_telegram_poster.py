@@ -1,0 +1,1248 @@
+#!/usr/bin/env python3
+"""Dragonfly Flash -> Telegram channel poster.
+
+Features:
+- text + images only; audio is intentionally ignored
+- no local media storage: sends image URLs to Telegram
+- SQLite state to avoid duplicate posts
+- backfill last N posts with conservative delays
+- watch mode polling every 15 seconds by default
+
+Required env:
+  DRAGONFLY_ACCESS_TOKEN=...
+  TELEGRAM_BOT_TOKEN=...
+  TELEGRAM_CHAT_ID=@channel_username  # or numeric channel id
+
+Dry-run examples:
+  DRAGONFLY_ACCESS_TOKEN=... python3 dragonfly_telegram_poster.py backfill --count 1000 --dry-run
+  DRAGONFLY_ACCESS_TOKEN=... python3 dragonfly_telegram_poster.py watch --dry-run
+"""
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import logging
+import os
+import sqlite3
+import sys
+import tempfile
+import time
+import traceback
+import http.cookiejar
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Iterable
+
+BASE_URL = "https://dragonfly-flash.ru"
+API_FEED = BASE_URL + "/api/feed?type={feed_type}&limit={limit}&offset={offset}"
+API_POST = BASE_URL + "/api/post/{post_id}"
+DEFAULT_DB = Path.home() / ".hermes" / "state" / "dragonfly_telegram_poster.sqlite3"
+TG_API = "https://api.telegram.org/bot{token}/{method}"
+MAX_TG_CAPTION = 1024
+MAX_TG_MESSAGE = 4096
+MAX_MEDIA_GROUP = 10
+PART_PLACEHOLDER_TOTAL = "999"
+DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_KEEP_SENT = 50_000
+DEFAULT_LOG_FILE = Path.home() / ".hermes" / "logs" / "dragonfly_telegram_poster.log"
+MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
+DEFAULT_API_429_BASE_SLEEP = 30.0
+DEFAULT_API_429_MAX_SLEEP = 900.0
+
+
+@dataclass
+class Config:
+    dragonfly_token: str | None
+    telegram_token: str | None
+    telegram_chat_id: str | None
+    db_path: Path
+    dry_run: bool
+    feed_type: str
+    request_delay: float
+    send_delay: float
+    text_delay: float
+    photo_delay: float
+    album_delay: float
+    animation_delay: float
+    mixed_media_delay: float
+    media_item_delay: float
+    poll_interval: float
+    limit: int
+    max_attempts: int
+    keep_sent: int
+    log_file: str | None
+    upload_media: bool
+    alert_chat_id: str | None
+    cookie_file: str | None
+
+
+LOGGER = logging.getLogger("dragonfly_telegram_poster")
+
+
+def setup_logging(log_file: str | None = str(DEFAULT_LOG_FILE), verbose: bool = False) -> None:
+    for handler in list(LOGGER.handlers):
+        LOGGER.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+    LOGGER.setLevel(logging.DEBUG if verbose else logging.INFO)
+    fmt = logging.Formatter("[%(asctime)s] %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    stream = logging.StreamHandler(sys.stdout)
+    stream.setLevel(logging.DEBUG if verbose else logging.INFO)
+    stream.setFormatter(fmt)
+    LOGGER.addHandler(stream)
+
+    if log_file:
+        path = Path(log_file).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(path, encoding="utf-8")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(fmt)
+        LOGGER.addHandler(fh)
+
+
+def log(msg: str, level: int = logging.INFO) -> None:
+    if not LOGGER.handlers:
+        setup_logging(None)
+    LOGGER.log(level, msg)
+
+
+def log_exception(msg: str, exc: BaseException) -> None:
+    log(f"{msg}: {exc}\n{traceback.format_exc()}", logging.ERROR)
+
+
+def human_duration(seconds: float) -> str:
+    seconds_i = int(round(seconds))
+    if seconds_i < 60:
+        return f"{seconds_i} сек"
+    minutes = seconds_i // 60
+    rem = seconds_i % 60
+    if rem:
+        return f"{minutes} мин {rem} сек"
+    return f"{minutes} мин"
+
+
+def send_alert(cfg: Config, title: str, body: str, *, level: str = "warning") -> None:
+    """Send a compact user-friendly operational alert to a private Telegram chat.
+
+    Never raises: alerts must not break the parser.
+    """
+    if not cfg.alert_chat_id or not cfg.telegram_token:
+        return
+    icon = {"info": "ℹ️", "warning": "⚠️", "error": "🚨", "success": "✅"}.get(level, "⚠️")
+    text = (
+        f"{icon} <b>{escape_text(title)}</b>\n\n"
+        f"{escape_text(body)}\n\n"
+        f"<i>{escape_text(datetime.now().strftime('%d.%m.%Y %H:%M:%S'))}</i>"
+    )
+    try:
+        tg_request(cfg, "sendMessage", {
+            "chat_id": cfg.alert_chat_id,
+            "text": text[:MAX_TG_MESSAGE],
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        })
+    except Exception as e:
+        log(f"alert delivery failed: {e}", logging.WARNING)
+
+
+def require_env(name: str) -> str:
+    v = os.environ.get(name, "").strip()
+    if not v:
+        raise SystemExit(f"Missing env var: {name}")
+    return v
+
+
+def optional_env(name: str) -> str | None:
+    v = os.environ.get(name, "").strip()
+    return v or None
+
+
+def load_env_file(path: str | None) -> None:
+    """Load simple KEY=VALUE lines into os.environ without external deps.
+
+    Existing environment variables win over values from the file.
+    """
+    if not path:
+        return
+    p = Path(path).expanduser()
+    if not p.exists():
+        raise SystemExit(f"Env file not found: {p}")
+    for raw in p.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def init_db(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(path)
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sent_posts (
+            post_id INTEGER PRIMARY KEY,
+            created_at TEXT,
+            sent_at TEXT NOT NULL,
+            author_name TEXT,
+            had_photos INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'sent',
+            failed_attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT
+        )
+        """
+    )
+    # Lightweight migrations for databases created by older script versions.
+    cols = {row[1] for row in con.execute("PRAGMA table_info(sent_posts)")}
+    for name, ddl in {
+        "status": "ALTER TABLE sent_posts ADD COLUMN status TEXT NOT NULL DEFAULT 'sent'",
+        "failed_attempts": "ALTER TABLE sent_posts ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0",
+        "last_error": "ALTER TABLE sent_posts ADD COLUMN last_error TEXT",
+    }.items():
+        if name not in cols:
+            con.execute(ddl)
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kv (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    con.commit()
+    return con
+
+
+def is_sent(con: sqlite3.Connection, post_id: int) -> bool:
+    row = con.execute("SELECT 1 FROM sent_posts WHERE post_id = ? AND status = 'sent'", (post_id,)).fetchone()
+    return row is not None
+
+
+def is_exhausted(con: sqlite3.Connection, post_id: int, max_attempts: int) -> bool:
+    row = con.execute(
+        "SELECT failed_attempts, status FROM sent_posts WHERE post_id = ?",
+        (post_id,),
+    ).fetchone()
+    return bool(row and row[1] == "failed" and int(row[0]) >= max_attempts)
+
+
+def mark_sent(con: sqlite3.Connection, post: dict[str, Any]) -> None:
+    con.execute(
+        """
+        INSERT OR REPLACE INTO sent_posts(post_id, created_at, sent_at, author_name, had_photos, status, failed_attempts, last_error)
+        VALUES(?, ?, ?, ?, ?, 'sent', 0, NULL)
+        """,
+        (
+            int(post["post_id"]),
+            post.get("created_at"),
+            datetime.now(timezone.utc).isoformat(),
+            post.get("author_name"),
+            1 if post.get("photos") else 0,
+        ),
+    )
+    con.commit()
+
+
+def mark_failed(con: sqlite3.Connection, post: dict[str, Any], error: str) -> None:
+    pid = int(post["post_id"])
+    existing = con.execute("SELECT failed_attempts FROM sent_posts WHERE post_id = ?", (pid,)).fetchone()
+    attempts = (int(existing[0]) if existing else 0) + 1
+    con.execute(
+        """
+        INSERT OR REPLACE INTO sent_posts(post_id, created_at, sent_at, author_name, had_photos, status, failed_attempts, last_error)
+        VALUES(?, ?, ?, ?, ?, 'failed', ?, ?)
+        """,
+        (
+            pid,
+            post.get("created_at"),
+            datetime.now(timezone.utc).isoformat(),
+            post.get("author_name"),
+            1 if post.get("photos") else 0,
+            attempts,
+            error[:1000],
+        ),
+    )
+    con.commit()
+
+
+def cleanup_sent(con: sqlite3.Connection, keep_sent: int = DEFAULT_KEEP_SENT) -> int:
+    """Delete old successful sent rows, keeping newest keep_sent by post_id.
+
+    Failed rows are preserved for diagnostics/retry history.
+    """
+    if keep_sent <= 0:
+        cur = con.execute("DELETE FROM sent_posts WHERE status = 'sent'")
+        con.commit()
+        return int(cur.rowcount or 0)
+    cur = con.execute(
+        """
+        DELETE FROM sent_posts
+        WHERE status = 'sent'
+          AND post_id NOT IN (
+              SELECT post_id FROM sent_posts
+              WHERE status = 'sent'
+              ORDER BY post_id DESC
+              LIMIT ?
+          )
+        """,
+        (int(keep_sent),),
+    )
+    con.commit()
+    return int(cur.rowcount or 0)
+
+
+def mark_seen_without_sending(con: sqlite3.Connection, posts: Iterable[dict[str, Any]]) -> int:
+    n = 0
+    for p in posts:
+        if isinstance(p.get("post_id"), int) and not is_sent(con, int(p["post_id"])):
+            mark_sent(con, p)
+            n += 1
+    return n
+
+
+def dragonfly_headers(cfg: Config) -> dict[str, str]:
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "dragonfly-telegram-poster/0.3",
+    }
+    # Cookie session is preferred. When configured, do not also send the legacy
+    # Bearer JWT; Dragonfly's frontend has moved to HttpOnly-cookie sessions.
+    if cfg.cookie_file:
+        return headers
+    if cfg.dragonfly_token:
+        headers["Authorization"] = f"Bearer {cfg.dragonfly_token}"
+    return headers
+
+
+def dragonfly_opener(cfg: Config):
+    if not cfg.cookie_file:
+        return None
+    path = Path(cfg.cookie_file).expanduser()
+    jar = http.cookiejar.MozillaCookieJar(str(path))
+    if path.exists():
+        jar.load(ignore_discard=True, ignore_expires=True)
+    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+
+def dragonfly_auth_alert(cfg: Config) -> Callable[[str], None]:
+    return lambda msg: send_alert(cfg, "Авторизация Dragonfly истекла", msg, level="error")
+
+
+def api_get_json(
+    url: str,
+    headers: dict[str, str],
+    timeout: int = 30,
+    retries: int = 4,
+    alert: Callable[[str], None] | None = None,
+    auth_alert: Callable[[str], None] | None = None,
+    opener: Any | None = None,
+) -> dict[str, Any]:
+    req = urllib.request.Request(url, headers=headers)
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            open_fn = opener.open if opener is not None else urllib.request.urlopen
+            with open_fn(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            if e.code == 401:
+                msg = "Авторизация Dragonfly истекла. Сайт вернул 401: cookie/JWT больше не работает. Нужно обновить авторизацию, иначе новые посты получать не получится."
+                if auth_alert:
+                    auth_alert(msg)
+                raise RuntimeError(f"HTTP 401 for {url}: {body[:500]}") from e
+            if e.code == 429 and attempt < retries:
+                retry_after = e.headers.get("Retry-After") if e.headers else None
+                sleep_for = min(DEFAULT_API_429_MAX_SLEEP, DEFAULT_API_429_BASE_SLEEP * (2 ** attempt))
+                try:
+                    if retry_after:
+                        sleep_for = max(sleep_for, float(retry_after))
+                except Exception:
+                    pass
+                last_error = RuntimeError(f"HTTP 429 for {url}: {body[:500]}")
+                log(f"Dragonfly rate limit 429; sleeping {sleep_for:.1f}s before retry attempt={attempt + 1}/{retries} url={url}", logging.WARNING)
+                if alert:
+                    alert(f"Получили 429 от Dragonfly. жду {human_duration(sleep_for)} и пытаюсь снова — попытка {attempt + 1}/{retries}.")
+                time.sleep(sleep_for)
+                continue
+            if e.code < 500 or attempt >= retries:
+                raise RuntimeError(f"HTTP {e.code} for {url}: {body[:500]}") from e
+            last_error = RuntimeError(f"HTTP {e.code} for {url}: {body[:500]}")
+        except urllib.error.URLError as e:
+            last_error = e
+            if attempt >= retries:
+                raise RuntimeError(f"Network error for {url}: {e}") from e
+        sleep_for = min(30.0, 2.0 * (2 ** attempt))
+        log(f"retry api_get_json attempt={attempt + 1}/{retries} sleep={sleep_for:.1f}s url={url} error={last_error}", logging.WARNING)
+        time.sleep(sleep_for)
+    raise RuntimeError(f"Network error for {url}: {last_error}")
+
+
+def fetch_feed_page(cfg: Config, offset: int) -> list[dict[str, Any]]:
+    url = API_FEED.format(feed_type=cfg.feed_type, limit=cfg.limit, offset=offset)
+    log(f"fetch feed page offset={offset} limit={cfg.limit} type={cfg.feed_type}", logging.DEBUG)
+    data = api_get_json(
+        url,
+        headers=dragonfly_headers(cfg),
+        alert=lambda msg: send_alert(cfg, "Dragonfly временно ограничил запросы", msg, level="warning"),
+        auth_alert=dragonfly_auth_alert(cfg),
+        opener=dragonfly_opener(cfg),
+    )
+    feed = data.get("feed") or []
+    log(f"fetched feed page offset={offset} posts={len(feed)}", logging.DEBUG)
+    return [p for p in feed if isinstance(p, dict) and isinstance(p.get("post_id"), int)]
+
+
+def fetch_post_by_id(cfg: Config, post_id: int) -> dict[str, Any] | None:
+    url = API_POST.format(post_id=int(post_id))
+    log(f"fetch post by id #{post_id}", logging.DEBUG)
+    try:
+        data = api_get_json(
+            url,
+            headers=dragonfly_headers(cfg),
+            alert=lambda msg: send_alert(cfg, "Dragonfly временно ограничил запросы", msg, level="warning"),
+            auth_alert=dragonfly_auth_alert(cfg),
+            opener=dragonfly_opener(cfg),
+        )
+    except RuntimeError as e:
+        msg = str(e)
+        if "HTTP 404" in msg or "HTTP 422" in msg:
+            log(f"post #{post_id} not available: {e}", logging.DEBUG)
+            return None
+        raise
+    candidate = data.get("post") if isinstance(data, dict) else None
+    if not isinstance(candidate, dict):
+        candidate = data if isinstance(data, dict) else None
+    if isinstance(candidate, dict) and isinstance(candidate.get("post_id"), int):
+        return candidate
+    return None
+
+
+def fetch_recent_posts(cfg: Config, count: int) -> list[dict[str, Any]]:
+    """Fetch up to count posts using offset pagination. Returns newest-first from API order."""
+    posts: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    offset = 0
+    while len(posts) < count:
+        page = fetch_feed_page(cfg, offset)
+        if not page:
+            break
+        for p in page:
+            pid = int(p["post_id"])
+            if pid not in seen:
+                posts.append(p)
+                seen.add(pid)
+                if len(posts) >= count:
+                    break
+        if len(page) < cfg.limit:
+            break
+        offset += cfg.limit
+        if cfg.request_delay > 0:
+            time.sleep(cfg.request_delay)
+    return posts
+
+
+def abs_url(path: str | None) -> str | None:
+    if not path:
+        return None
+    if path.startswith("http://") or path.startswith("https://"):
+        return path
+    return BASE_URL + "/" + path.lstrip("/")
+
+
+def parse_time(s: str | None) -> str:
+    if not s:
+        return ""
+    try:
+        # Frontend treats API timestamps as UTC by appending Z.
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return s
+
+
+def post_url(post_id: int) -> str:
+    return f"{BASE_URL}/?post={post_id}"
+
+
+def escape_text(value: Any) -> str:
+    """Normalize and escape visible Telegram HTML text.
+
+    Dragonfly sometimes returns already-escaped entities like &#x27; for an
+    apostrophe. Decode them first, then escape only characters that would break
+    Telegram HTML. Apostrophes/quotes in visible text stay readable.
+    """
+    return html.escape(html.unescape(str(value)), quote=False)
+
+
+def escape_attr(value: Any) -> str:
+    """Escape Telegram HTML attribute values such as href."""
+    return html.escape(str(value), quote=True)
+
+
+def _first_nonempty(d: dict[str, Any], keys: Iterable[str]) -> str:
+    for k in keys:
+        v = d.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return ""
+
+
+def _format_duration(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    try:
+        seconds = int(float(str(value)))
+    except Exception:
+        return str(value).strip()
+    if seconds <= 0:
+        return ""
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def _basename(value: str) -> str:
+    if not value:
+        return ""
+    parsed = urllib.parse.urlparse(value)
+    return Path(parsed.path or value).name
+
+
+def audio_info_html(post: dict[str, Any]) -> str:
+    audios = post.get("audios") or []
+    if not isinstance(audios, list) or not audios:
+        return ""
+    lines: list[str] = []
+    for idx, audio in enumerate(audios[:5], start=1):
+        if not isinstance(audio, dict):
+            continue
+        artist = _first_nonempty(audio, ["artist", "author", "performer", "singer", "creator", "owner_name"])
+        title = _first_nonempty(audio, ["title", "name", "track", "song", "audio_name", "original_name"])
+        duration = _format_duration(_first_nonempty(audio, ["duration", "duration_sec", "duration_seconds", "length", "time"]))
+        file_name = _basename(_first_nonempty(audio, ["file_path", "path", "url", "src", "file", "filename"]))
+
+        if artist and title:
+            main = f"{artist} — {title}"
+        else:
+            main = title or artist or file_name or "трек"
+
+        details = []
+        if duration:
+            details.append(duration)
+        suffix = f" ({', '.join(details)})" if details else ""
+        prefix = f"{idx}. " if len(audios) > 1 else ""
+        lines.append(prefix + escape_text(main + suffix))
+    if not lines:
+        return ""
+    if len(lines) == 1:
+        return "🎵 <b>Трек:</b> " + lines[0]
+    return "🎵 <b>Музыка:</b>\n" + "\n".join(lines)
+
+
+def is_publishable(post: dict[str, Any]) -> bool:
+    """Return True when a post has text, visual media, or useful audio info."""
+    text = (post.get("description") or "").strip()
+    return bool(text or photo_urls(post) or audio_info_html(post))
+
+
+def profile_url(post: dict[str, Any]) -> str | None:
+    author_link = str(post.get("author_link") or "").strip()
+    if not author_link:
+        return None
+    if author_link.startswith("http://") or author_link.startswith("https://"):
+        return author_link
+    return BASE_URL + "/?id=" + urllib.parse.quote(author_link.lstrip("/"), safe="")
+
+
+def post_header_html(post: dict[str, Any], *, continuation: bool = False) -> str:
+    pid = int(post["post_id"])
+    author = escape_text(post.get("author_name") or "Пользователь")
+    created = escape_text(parse_time(post.get("created_at")))
+    url = profile_url(post)
+    if url:
+        author_html = f'👤 <a href="{escape_attr(url)}">{author}</a>'
+    else:
+        author_html = f"👤 <b>{author}</b>"
+    lines: list[str] = [author_html]
+    if created:
+        lines.append(f"🕒 <i>{created}</i>")
+    if continuation:
+        lines.append(f"<i>продолжение поста #{pid}</i>")
+    return "\n".join(lines)
+
+
+def post_meta_html(post: dict[str, Any]) -> str:
+    parts: list[str] = []
+    audio = audio_info_html(post)
+    if audio:
+        parts.append(audio)
+    if post.get("is_repost"):
+        parts.append("🔄 репост")
+    return "\n".join(parts)
+
+
+def post_link_html(post: dict[str, Any]) -> str:
+    pid = int(post["post_id"])
+    return f'<a href="{escape_attr(post_url(pid))}">#{pid}</a>'
+
+
+def _largest_prefix_that_fits(raw: str, prefix: str, suffix: str, limit: int) -> int:
+    """Largest raw prefix length whose escaped rendering fits limit."""
+    lo, hi = 0, len(raw)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(prefix + escape_text(raw[:mid].rstrip()) + suffix) <= limit:
+            lo = mid
+        else:
+            hi = mid - 1
+    if lo <= 0:
+        raise ValueError("Telegram limit too small for post header/footer")
+
+    # Prefer a natural whitespace boundary when it does not waste too much room.
+    boundary = max(raw.rfind(" ", 0, lo), raw.rfind("\n", 0, lo))
+    if boundary >= int(lo * 0.75):
+        return boundary + 1
+    return lo
+
+
+def format_html_chunks(post: dict[str, Any], *, limit: int) -> list[str]:
+    """Build one or more Telegram HTML messages/captions within a hard limit.
+
+    Each chunk contains author/time context. Non-final chunks end with a clear
+    continuation marker; the final chunk contains media/repost metadata and the
+    original post link.
+    """
+    raw_text = (post.get("description") or "").strip()
+    meta = post_meta_html(post)
+    final_suffix = ""
+    if meta:
+        final_suffix += "\n\n" + meta
+    final_suffix += "\n\n" + post_link_html(post)
+    continue_suffix = f"\n\n<i>({{part}}/{PART_PLACEHOLDER_TOTAL})</i>"
+
+    if not raw_text:
+        body = post_header_html(post) + final_suffix
+        if len(body) <= limit:
+            return [body]
+        # Extremely defensive: this should not happen with current header sizes.
+        return [body[: max(0, limit - 1)].rstrip() + "…"]
+
+    chunks: list[str] = []
+    remaining = raw_text
+    first = True
+    while remaining:
+        prefix = post_header_html(post, continuation=not first) + "\n\n"
+        final_part_suffix = f"\n\n<i>({{part}}/{PART_PLACEHOLDER_TOTAL})</i>" + final_suffix
+        if len(prefix + escape_text(remaining) + final_part_suffix) <= limit:
+            chunks.append(prefix + escape_text(remaining) + final_part_suffix)
+            break
+
+        part_no = len(chunks) + 1
+        this_continue_suffix = continue_suffix.replace("{part}", str(part_no))
+        n = _largest_prefix_that_fits(remaining, prefix, this_continue_suffix, limit)
+        part = remaining[:n].rstrip()
+        chunks.append(prefix + escape_text(part) + this_continue_suffix)
+        remaining = remaining[n:].lstrip()
+        first = False
+
+    if len(chunks) <= 1:
+        return [chunks[0].replace(f"\n\n<i>({{part}}/{PART_PLACEHOLDER_TOTAL})</i>", "")]
+
+    total = str(len(chunks))
+    numbered = []
+    for i, chunk in enumerate(chunks, start=1):
+        chunk = chunk.replace("{part}", str(i)).replace(PART_PLACEHOLDER_TOTAL, total)
+        numbered.append(chunk)
+    return numbered
+
+
+def format_html(post: dict[str, Any], *, caption: bool = False) -> str:
+    """Backward-compatible single chunk formatter.
+
+    New sending code uses format_html_chunks() so long posts are split instead
+    of truncated.
+    """
+    return format_html_chunks(post, limit=MAX_TG_CAPTION if caption else MAX_TG_MESSAGE)[0]
+
+
+def photo_urls(post: dict[str, Any]) -> list[str]:
+    urls: list[str] = []
+    for ph in post.get("photos") or []:
+        u = abs_url(ph.get("url"))
+        if u:
+            urls.append(u)
+    return urls
+
+
+def is_gif_url(url: str) -> bool:
+    path = urllib.parse.urlparse(url).path.lower()
+    return path.endswith(".gif")
+
+
+def tg_request(cfg: Config, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    log(f"telegram request method={method} chat_id={payload.get('chat_id')} dry_run={cfg.dry_run}", logging.DEBUG)
+    if cfg.dry_run:
+        log(f"DRY-RUN Telegram {method}: {json.dumps(payload, ensure_ascii=False)[:1200]}")
+        return {"ok": True, "result": {"dry_run": True}}
+    if not cfg.telegram_token or not cfg.telegram_chat_id:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required unless --dry-run")
+
+    url = TG_API.format(token=cfg.telegram_token, method=method)
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json", "User-Agent": "dragonfly-telegram-poster/0.2"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        # Telegram flood wait is often HTTP 429 with retry_after.
+        try:
+            err = json.loads(raw)
+            retry = int(((err.get("parameters") or {}).get("retry_after") or 0))
+        except Exception:
+            retry = 0
+        if e.code == 429 and retry > 0:
+            sleep_for = retry + 2
+            log(f"Telegram flood wait: sleeping {sleep_for}s")
+            if str(payload.get("chat_id")) != str(cfg.alert_chat_id):
+                send_alert(
+                    cfg,
+                    "Telegram попросил притормозить",
+                    f"Получили 429 от Telegram. Жду {human_duration(sleep_for)} и продолжаю отправку. Метод: {method}.",
+                    level="warning",
+                )
+            time.sleep(sleep_for)
+            return tg_request(cfg, method, payload)
+        raise RuntimeError(f"Telegram HTTP {e.code}: {raw[:1000]}") from e
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram API error: {data}")
+    return data
+
+
+def tg_multipart_request(cfg: Config, method: str, fields: dict[str, str], files: dict[str, tuple[str, bytes, str]]) -> dict[str, Any]:
+    log(f"telegram multipart method={method} chat_id={fields.get('chat_id')} files={list(files)} dry_run={cfg.dry_run}", logging.DEBUG)
+    if cfg.dry_run:
+        safe = {"fields": fields, "files": {k: {"filename": v[0], "bytes": len(v[1]), "content_type": v[2]} for k, v in files.items()}}
+        log(f"DRY-RUN Telegram multipart {method}: {json.dumps(safe, ensure_ascii=False)[:1200]}")
+        return {"ok": True, "result": {"dry_run": True}}
+    if not cfg.telegram_token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is required unless --dry-run")
+
+    boundary = "----dragonflyBoundary" + str(int(time.time() * 1000000))
+    body = bytearray()
+    for k, v in fields.items():
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(f'Content-Disposition: form-data; name="{k}"\r\n\r\n'.encode())
+        body.extend(str(v).encode("utf-8"))
+        body.extend(b"\r\n")
+    for field, (filename, content, ctype) in files.items():
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(f'Content-Disposition: form-data; name="{field}"; filename="{filename}"\r\n'.encode())
+        body.extend(f"Content-Type: {ctype}\r\n\r\n".encode())
+        body.extend(content)
+        body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode())
+
+    req = urllib.request.Request(
+        TG_API.format(token=cfg.telegram_token, method=method),
+        data=bytes(body),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "User-Agent": "dragonfly-telegram-poster/0.2"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        try:
+            err = json.loads(raw)
+            retry = int(((err.get("parameters") or {}).get("retry_after") or 0))
+        except Exception:
+            retry = 0
+        if e.code == 429 and retry > 0:
+            sleep_for = retry + 2
+            log(f"Telegram flood wait: sleeping {sleep_for}s")
+            if str(fields.get("chat_id")) != str(cfg.alert_chat_id):
+                send_alert(
+                    cfg,
+                    "Telegram попросил притормозить",
+                    f"Получили 429 от Telegram. Жду {human_duration(sleep_for)} и продолжаю отправку медиа. Метод: {method}.",
+                    level="warning",
+                )
+            time.sleep(sleep_for)
+            return tg_multipart_request(cfg, method, fields, files)
+        raise RuntimeError(f"Telegram HTTP {e.code}: {raw[:1000]}") from e
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram API error: {data}")
+    return data
+
+
+def download_media_bytes(url: str, retries: int = 3) -> tuple[str, bytes, str]:
+    """Download media into memory for Telegram upload; nothing persists on disk.
+
+    Dragonfly media endpoints sometimes throw SSL EOF/handshake timeouts or 5xx.
+    Retry those before falling back to text-only publication.
+    """
+    log(f"download media url={url}", logging.DEBUG)
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                ctype = resp.headers.get("content-type") or "application/octet-stream"
+                clen = resp.headers.get("content-length")
+                if clen and int(clen) > MAX_DOWNLOAD_BYTES:
+                    raise RuntimeError(f"media too large: {clen} bytes url={url}")
+                data = resp.read(MAX_DOWNLOAD_BYTES + 1)
+            if len(data) > MAX_DOWNLOAD_BYTES:
+                raise RuntimeError(f"media too large: >{MAX_DOWNLOAD_BYTES} bytes url={url}")
+            path = urllib.parse.urlparse(url).path
+            filename = Path(path).name or ("media.gif" if "gif" in ctype else "media.jpg")
+            return filename, data, ctype
+        except urllib.error.HTTPError as e:
+            last_error = e
+            if e.code not in (429, 500, 502, 503, 504) or attempt >= retries:
+                raise
+        except urllib.error.URLError as e:
+            last_error = e
+            if attempt >= retries:
+                raise
+        sleep_for = min(60.0, 5.0 * (2 ** attempt))
+        log(f"retry media download attempt={attempt + 1}/{retries} sleep={sleep_for:.1f}s url={url} error={last_error}", logging.WARNING)
+        time.sleep(sleep_for)
+    raise RuntimeError(f"media download failed for {url}: {last_error}")
+
+
+def send_text_chunks(cfg: Config, chunks: list[str], *, start_at: int = 0) -> None:
+    chat_id = cfg.telegram_chat_id
+    for chunk in chunks[start_at:]:
+        tg_request(cfg, "sendMessage", {
+            "chat_id": chat_id,
+            "text": chunk,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": False,
+        })
+        if cfg.send_delay > 0:
+            time.sleep(cfg.send_delay)
+
+
+def send_media_fallback(cfg: Config, post: dict[str, Any], error: Exception) -> None:
+    fallback = dict(post)
+    original_text = (fallback.get("description") or "").strip()
+    warning = "⚠️ Медиа не отправилось, поэтому публикую текст и ссылку на оригинал."
+    if original_text:
+        fallback["description"] = warning + "\n\n" + original_text
+    else:
+        fallback["description"] = warning
+    fallback["photos"] = []
+    log(f"media fallback for post #{post.get('post_id')}: {error}")
+    send_text_chunks(cfg, format_html_chunks(fallback, limit=MAX_TG_MESSAGE))
+
+
+def send_one_media(cfg: Config, url: str, *, caption: str | None = None) -> None:
+    chat_id = cfg.telegram_chat_id
+    if is_gif_url(url):
+        if cfg.upload_media:
+            filename, data, ctype = download_media_bytes(url)
+            fields = {"chat_id": str(chat_id)}
+            if caption:
+                fields["caption"] = caption
+                fields["parse_mode"] = "HTML"
+            tg_multipart_request(cfg, "sendAnimation", fields, {"animation": (filename, data, ctype)})
+        else:
+            payload: dict[str, Any] = {"chat_id": chat_id, "animation": url}
+            if caption:
+                payload["caption"] = caption
+                payload["parse_mode"] = "HTML"
+            tg_request(cfg, "sendAnimation", payload)
+    else:
+        if cfg.upload_media:
+            filename, data, ctype = download_media_bytes(url)
+            fields = {"chat_id": str(chat_id)}
+            if caption:
+                fields["caption"] = caption
+                fields["parse_mode"] = "HTML"
+            tg_multipart_request(cfg, "sendPhoto", fields, {"photo": (filename, data, ctype)})
+        else:
+            payload = {"chat_id": chat_id, "photo": url}
+            if caption:
+                payload["caption"] = caption
+                payload["parse_mode"] = "HTML"
+            tg_request(cfg, "sendPhoto", payload)
+
+
+def send_photo_groups(cfg: Config, photos: list[str], *, caption: str | None = None) -> None:
+    chat_id = cfg.telegram_chat_id
+    for group_index, start in enumerate(range(0, len(photos), MAX_MEDIA_GROUP)):
+        group = photos[start:start + MAX_MEDIA_GROUP]
+        media = []
+        files: dict[str, tuple[str, bytes, str]] = {}
+        for i, u in enumerate(group):
+            media_ref = u
+            if cfg.upload_media:
+                filename, data, ctype = download_media_bytes(u)
+                field = f"photo{group_index}_{i}"
+                files[field] = (filename, data, ctype)
+                media_ref = f"attach://{field}"
+            item: dict[str, Any] = {"type": "photo", "media": media_ref}
+            if group_index == 0 and i == 0 and caption:
+                item["caption"] = caption
+                item["parse_mode"] = "HTML"
+            media.append(item)
+        if cfg.upload_media:
+            tg_multipart_request(cfg, "sendMediaGroup", {"chat_id": str(chat_id), "media": json.dumps(media, ensure_ascii=False)}, files)
+        else:
+            tg_request(cfg, "sendMediaGroup", {"chat_id": chat_id, "media": media})
+        if cfg.media_item_delay > 0 and start + MAX_MEDIA_GROUP < len(photos):
+            time.sleep(cfg.media_item_delay)
+
+
+def send_post(cfg: Config, post: dict[str, Any]) -> None:
+    pid = int(post["post_id"])
+    photos = photo_urls(post)
+    if not is_publishable(post):
+        log(f"skipped empty post #{pid}")
+        return
+
+    if not photos:
+        send_text_chunks(cfg, format_html_chunks(post, limit=MAX_TG_MESSAGE))
+        log(f"sent text post #{pid}")
+        return
+
+    chunks = format_html_chunks(post, limit=MAX_TG_CAPTION)
+    caption = chunks[0]
+
+    try:
+        if len(photos) == 1:
+            send_one_media(cfg, photos[0], caption=caption)
+            send_text_chunks(cfg, chunks, start_at=1)
+            log(f"sent {'animation' if is_gif_url(photos[0]) else 'photo'} post #{pid}")
+            return
+
+        # If there are GIFs mixed with photos, avoid mediaGroup: albums do not support
+        # animation reliably. Send media one by one slowly.
+        if any(is_gif_url(u) for u in photos):
+            for i, u in enumerate(photos):
+                send_one_media(cfg, u, caption=caption if i == 0 else None)
+                if cfg.media_item_delay > 0:
+                    time.sleep(cfg.media_item_delay)
+            send_text_chunks(cfg, chunks, start_at=1)
+            log(f"sent mixed media post #{pid} media={len(photos)}")
+            return
+
+        # Telegram mediaGroup: max 10 items, caption only on the first item of the
+        # first album. Additional albums carry only media; text continues below.
+        send_photo_groups(cfg, photos, caption=caption)
+        send_text_chunks(cfg, chunks, start_at=1)
+        log(f"sent album post #{pid} photos={len(photos)}")
+    except Exception as e:
+        send_media_fallback(cfg, post, e)
+
+
+def delay_for_post(cfg: Config, post: dict[str, Any]) -> float:
+    """Choose post-level delay by content type.
+
+    Text can be fast; GIF/animation can be slow. cfg.send_delay remains only a
+    backward-compatible default used to initialize type-specific CLI defaults.
+    """
+    photos = photo_urls(post)
+    if not photos:
+        return float(cfg.text_delay)
+    gif_count = sum(1 for u in photos if is_gif_url(u))
+    if gif_count and gif_count != len(photos):
+        return float(cfg.mixed_media_delay)
+    if gif_count:
+        return float(cfg.animation_delay)
+    if len(photos) > 1:
+        return float(cfg.album_delay)
+    return float(cfg.photo_delay)
+
+
+def send_new_posts(cfg: Config, con: sqlite3.Connection, posts_newest_first: list[dict[str, Any]], *, mark_only: bool = False) -> int:
+    # Send oldest -> newest so channel chronology is natural.
+    new_posts = [
+        p for p in reversed(posts_newest_first)
+        if not is_sent(con, int(p["post_id"]))
+        and not is_exhausted(con, int(p["post_id"]), cfg.max_attempts)
+    ]
+    sent = 0
+    for p in new_posts:
+        pid = int(p["post_id"])
+        if not is_publishable(p):
+            if not cfg.dry_run:
+                mark_sent(con, p)
+            log(f"marked empty post #{pid} as seen" if not cfg.dry_run else f"dry-run skipped empty post #{pid}")
+            continue
+        if mark_only:
+            mark_sent(con, p)
+            sent += 1
+            log(f"marked seen #{pid}")
+            continue
+        try:
+            send_post(cfg, p)
+            if not cfg.dry_run:
+                mark_sent(con, p)
+            sent += 1
+        except Exception as e:
+            mark_failed(con, p, str(e))
+            log_exception(f"post #{pid} failed", e)
+            if is_exhausted(con, pid, cfg.max_attempts):
+                log(f"post #{pid} failed permanently after {cfg.max_attempts} attempts: {e}", logging.ERROR)
+                send_alert(
+                    cfg,
+                    f"Пост #{pid} пропущен после {cfg.max_attempts} попыток",
+                    f"Не получилось отправить пост. Я записал ошибку в лог и больше не буду блокировать очередь на этом посте. Причина: {str(e)[:500]}",
+                    level="error",
+                )
+            else:
+                log(f"post #{pid} failed, will retry later: {e}", logging.WARNING)
+                send_alert(
+                    cfg,
+                    f"Пост #{pid} временно не отправился",
+                    f"Попробую позже. Причина: {str(e)[:500]}",
+                    level="warning",
+                )
+            continue
+        post_delay = delay_for_post(cfg, p)
+        if post_delay > 0:
+            time.sleep(post_delay)
+    return sent
+
+
+def catch_up_missing_ids(
+    cfg: Config,
+    con: sqlite3.Connection,
+    *,
+    min_id: int,
+    max_id: int,
+    known_ids: set[int],
+    mark_only: bool = False,
+    max_gap_scan: int = 5000,
+) -> int:
+    """Fetch and process missing post IDs inside a known range.
+
+    Feed pagination can omit IDs or a run can be interrupted. This pass uses
+    /api/post/<id> as a slower, exact catch-up path so existing missing posts are
+    eventually published. Unavailable IDs are skipped without blocking.
+    """
+    if max_id < min_id:
+        return 0
+    span = max_id - min_id + 1
+    if span > max_gap_scan:
+        log(f"gap catch-up skipped: span={span} exceeds max_gap_scan={max_gap_scan}", logging.WARNING)
+        return 0
+
+    processed = 0
+    checked = 0
+    for pid in range(min_id, max_id + 1):
+        if pid in known_ids or is_sent(con, pid) or is_exhausted(con, pid, cfg.max_attempts):
+            continue
+        checked += 1
+        try:
+            p = fetch_post_by_id(cfg, pid)
+        except Exception as e:
+            log_exception(f"gap catch-up fetch post #{pid} failed", e)
+            continue
+        if p is None:
+            log(f"gap catch-up post #{pid} not found/available", logging.DEBUG)
+        else:
+            processed += send_new_posts(cfg, con, [p], mark_only=mark_only)
+        if cfg.request_delay > 0:
+            time.sleep(cfg.request_delay)
+    if checked or processed:
+        log(f"gap catch-up done range={min_id}-{max_id} checked={checked} processed={processed}")
+    return processed
+
+
+def cmd_init(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
+    posts = fetch_recent_posts(cfg, args.count)
+    n = mark_seen_without_sending(con, posts)
+    deleted = cleanup_sent(con, cfg.keep_sent)
+    max_id = max((int(p["post_id"]) for p in posts), default=None)
+    log(f"initialized: fetched={len(posts)} newly_marked={n} max_post_id={max_id} cleanup_deleted={deleted}")
+    return 0
+
+
+def cmd_backfill(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
+    posts = fetch_recent_posts(cfg, args.count)
+    log(f"backfill fetched={len(posts)} requested={args.count}")
+    n = send_new_posts(cfg, con, posts, mark_only=args.mark_only)
+    catchup = 0
+    if args.catch_up_gaps and posts:
+        ids = {int(p["post_id"]) for p in posts}
+        catchup = catch_up_missing_ids(
+            cfg,
+            con,
+            min_id=min(ids),
+            max_id=max(ids),
+            known_ids=ids,
+            mark_only=args.mark_only,
+            max_gap_scan=args.max_gap_scan,
+        )
+    deleted = cleanup_sent(con, cfg.keep_sent)
+    log(f"backfill done processed={n} catchup_processed={catchup} cleanup_deleted={deleted}")
+    return 0
+
+
+def cmd_watch(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
+    log(f"watch started poll_interval={cfg.poll_interval}s send_delay={cfg.send_delay}s dry_run={cfg.dry_run}")
+    while True:
+        try:
+            posts = fetch_recent_posts(cfg, args.page_size)
+            n = send_new_posts(cfg, con, posts)
+            catchup = 0
+            if args.catch_up_gaps and posts:
+                ids = {int(p["post_id"]) for p in posts}
+                catchup = catch_up_missing_ids(
+                    cfg,
+                    con,
+                    min_id=min(ids),
+                    max_id=max(ids),
+                    known_ids=ids,
+                    max_gap_scan=args.max_gap_scan,
+                )
+            if n:
+                log(f"watch sent new posts: {n}")
+            if catchup:
+                log(f"watch caught up missing posts: {catchup}")
+            if n or catchup:
+                deleted = cleanup_sent(con, cfg.keep_sent)
+                if deleted:
+                    log(f"cleanup deleted old sent rows: {deleted}")
+        except Exception as e:
+            # Keep process alive on transient site/TG errors.
+            log_exception("watch loop error", e)
+            send_alert(
+                cfg,
+                "Ошибка в watch-цикле",
+                f"Парсер не остановлен: подожду {human_duration(cfg.poll_interval)} и попробую снова. Причина: {str(e)[:500]}",
+                level="error",
+            )
+        time.sleep(cfg.poll_interval)
+
+
+def cmd_auth_check(cfg: Config) -> int:
+    try:
+        posts = fetch_feed_page(cfg, 0)
+    except Exception as e:
+        log(f"auth-check failed: {e}", logging.ERROR)
+        return 1
+    mode = "cookie" if cfg.cookie_file else "bearer-jwt"
+    log(f"auth-check OK mode={mode} sample_posts={len(posts)}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Dragonfly Flash feed to Telegram")
+    p.add_argument("--env-file", default=None, help="load KEY=VALUE secrets from file before reading env")
+    p.add_argument("--db", default=str(DEFAULT_DB))
+    p.add_argument("--feed-type", default="all", choices=["all", "friends"])
+    p.add_argument("--limit", type=int, default=20, help="API page size")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--request-delay", type=float, default=1.0, help="delay between Dragonfly pagination requests")
+    p.add_argument("--send-delay", type=float, default=4.0, help="legacy fallback delay; type-specific delays below are preferred")
+    p.add_argument("--text-delay", type=float, default=2.0, help="delay after a text-only post")
+    p.add_argument("--photo-delay", type=float, default=8.0, help="delay after a single photo post")
+    p.add_argument("--album-delay", type=float, default=15.0, help="delay after a photo album post")
+    p.add_argument("--animation-delay", type=float, default=45.0, help="delay after GIF/animation post; Telegram rate-limits these harder")
+    p.add_argument("--mixed-media-delay", type=float, default=45.0, help="delay after mixed GIF/photo post")
+    p.add_argument("--media-item-delay", type=float, default=12.0, help="delay between multiple media items/albums inside one post")
+    p.add_argument("--poll-interval", type=float, default=15.0)
+    p.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS, help="per-post retry limit before skipping")
+    p.add_argument("--keep-sent", type=int, default=DEFAULT_KEEP_SENT, help="keep only newest N successful sent rows; failed rows are preserved")
+    p.add_argument("--log-file", default=str(DEFAULT_LOG_FILE), help="write logs to this file; use empty string to disable file logging")
+    p.add_argument("--verbose", action="store_true", help="enable debug logging")
+    p.add_argument("--url-media", action="store_true", help="send media as URLs instead of uploading downloaded bytes (not recommended for Dragonfly)")
+    p.add_argument("--alert-chat-id", default=None, help="send user-friendly warnings/errors to this Telegram user/chat; env TELEGRAM_ALERT_CHAT_ID also works")
+    p.add_argument("--cookie-file", default=None, help="Dragonfly Mozilla/Netscape cookie jar; env DRAGONFLY_COOKIE_FILE also works. Preferred over legacy JWT.")
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("auth-check", help="check Dragonfly authentication and exit")
+
+    s = sub.add_parser("init", help="mark recent posts as seen without sending")
+    s.add_argument("--count", type=int, default=20)
+
+    s = sub.add_parser("backfill", help="send recent historical posts")
+    s.add_argument("--count", type=int, default=1000)
+    s.add_argument("--mark-only", action="store_true", help="mark as sent without sending")
+    s.add_argument("--no-catch-up-gaps", dest="catch_up_gaps", action="store_false", default=True, help="disable exact /api/post/<id> gap catch-up")
+    s.add_argument("--max-gap-scan", type=int, default=5000, help="largest ID span to scan for missing posts")
+
+    s = sub.add_parser("watch", help="poll forever")
+    s.add_argument("--page-size", type=int, default=20)
+    s.add_argument("--no-catch-up-gaps", dest="catch_up_gaps", action="store_false", default=True, help="disable exact /api/post/<id> gap catch-up")
+    s.add_argument("--max-gap-scan", type=int, default=200, help="largest ID span to scan for missing posts per poll")
+    return p
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    load_env_file(args.env_file)
+    setup_logging(args.log_file or None, verbose=bool(args.verbose))
+    cfg = Config(
+        dragonfly_token=optional_env("DRAGONFLY_ACCESS_TOKEN"),
+        telegram_token=optional_env("TELEGRAM_BOT_TOKEN"),
+        telegram_chat_id=optional_env("TELEGRAM_CHAT_ID") or "@dragonfly_flash",
+        db_path=Path(args.db),
+        dry_run=bool(args.dry_run),
+        feed_type=args.feed_type,
+        request_delay=float(args.request_delay),
+        send_delay=float(args.send_delay),
+        text_delay=float(args.text_delay),
+        photo_delay=float(args.photo_delay),
+        album_delay=float(args.album_delay),
+        animation_delay=float(args.animation_delay),
+        mixed_media_delay=float(args.mixed_media_delay),
+        media_item_delay=float(args.media_item_delay),
+        poll_interval=float(args.poll_interval),
+        limit=int(args.limit),
+        max_attempts=int(args.max_attempts),
+        keep_sent=int(args.keep_sent),
+        log_file=args.log_file or None,
+        upload_media=not bool(args.url_media),
+        alert_chat_id=args.alert_chat_id or optional_env("TELEGRAM_ALERT_CHAT_ID"),
+        cookie_file=args.cookie_file or optional_env("DRAGONFLY_COOKIE_FILE"),
+    )
+    if not cfg.cookie_file and not cfg.dragonfly_token:
+        raise SystemExit("Set DRAGONFLY_COOKIE_FILE or DRAGONFLY_ACCESS_TOKEN")
+    if not cfg.dry_run and (not cfg.telegram_token or not cfg.telegram_chat_id):
+        raise SystemExit("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required unless --dry-run")
+    con = init_db(cfg.db_path)
+    if args.cmd == "auth-check":
+        return cmd_auth_check(cfg)
+    if args.cmd == "init":
+        return cmd_init(cfg, con, args)
+    if args.cmd == "backfill":
+        return cmd_backfill(cfg, con, args)
+    if args.cmd == "watch":
+        return cmd_watch(cfg, con, args)
+    raise AssertionError(args.cmd)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
