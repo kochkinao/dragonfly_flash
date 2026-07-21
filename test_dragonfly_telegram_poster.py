@@ -651,6 +651,32 @@ class DragonflyPosterTests(unittest.TestCase):
         row = con.execute("SELECT last_likes, last_comments FROM telegram_messages WHERE post_id=889").fetchone()
         self.assertEqual(row, (3, 4))
 
+    def test_long_split_post_records_last_role_for_final_part(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        seq = {'message_id': 100}
+        orig = poster.tg_request
+        orig_sleep = poster.time.sleep
+
+        def fake_tg_request(cfg, method, payload):
+            seq['message_id'] += 1
+            return {'ok': True, 'result': {'message_id': seq['message_id']}}
+
+        poster.tg_request = fake_tg_request
+        poster.time.sleep = lambda *_: None
+        try:
+            n = poster.send_new_posts(c, con, [post(post_id=890, description='абвгд ' * 900)])
+        finally:
+            poster.tg_request = orig
+            poster.time.sleep = orig_sleep
+
+        self.assertEqual(n, 1)
+        rows = dict(con.execute("SELECT role, message_id FROM telegram_messages WHERE post_id=890").fetchall())
+        self.assertIn('main', rows)
+        self.assertIn('last', rows)
+        self.assertLess(rows['main'], rows['last'])
+
     def test_failed_posts_stop_after_attempt_limit(self):
         con = poster.init_db(Path(':memory:'))
         p = post(post_id=777, description='text')

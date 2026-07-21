@@ -407,6 +407,13 @@ def _message_id_from_tg_response(resp: dict[str, Any]) -> int | None:
     return _message_id_from_result(result)
 
 
+def _last_message_id_from_tg_response(resp: dict[str, Any]) -> int | None:
+    result = resp.get("result") if isinstance(resp, dict) else None
+    if isinstance(result, list) and result:
+        return _message_id_from_result(result[-1])
+    return _message_id_from_result(result)
+
+
 def extract_post_stats(post: dict[str, Any]) -> tuple[int | None, int | None]:
     def as_int(value: Any) -> int | None:
         if value is None or value == "":
@@ -1138,7 +1145,7 @@ def send_text_chunks(cfg: Config, chunks: list[str], *, start_at: int = 0) -> li
     return responses
 
 
-def send_media_fallback(cfg: Config, post: dict[str, Any], error: Exception) -> None:
+def send_media_fallback(cfg: Config, post: dict[str, Any], error: Exception) -> dict[str, Any]:
     fallback = dict(post)
     original_text = (fallback.get("description") or "").strip()
     warning = "⚠️ Медиа не отправилось, поэтому публикую текст и ссылку на оригинал."
@@ -1150,7 +1157,12 @@ def send_media_fallback(cfg: Config, post: dict[str, Any], error: Exception) -> 
     log(f"media fallback for post #{post.get('post_id')}: {error}")
     chunks = format_chunks_for_send(fallback, limit=MAX_TG_MESSAGE)
     responses = send_text_chunks(cfg, chunks)
-    return {"message_kind": "text", "message_id": _message_id_from_tg_response(responses[0]) if responses else None, "base_html": chunks[0] if chunks else ""}
+    main_resp = responses[0] if responses else {}
+    last_resp = responses[-1] if responses else {}
+    return {
+        "main": {"message_kind": "text", "message_id": _message_id_from_tg_response(main_resp), "base_html": chunks[0] if chunks else ""},
+        "last": {"message_kind": "text", "message_id": _last_message_id_from_tg_response(last_resp), "base_html": chunks[-1] if chunks else ""},
+    }
 
 
 def send_one_media(cfg: Config, url: str, *, caption: str | None = None) -> dict[str, Any]:
@@ -1220,11 +1232,20 @@ def send_post(cfg: Config, post: dict[str, Any]) -> dict[str, Any] | None:
     if not photos:
         chunks = format_chunks_for_send(post, limit=MAX_TG_MESSAGE)
         responses = send_text_chunks(cfg, chunks)
+        main_resp = responses[0] if responses else {}
+        last_resp = responses[-1] if responses else {}
         log(f"sent text post #{pid}")
         return {
-            "message_kind": "text",
-            "message_id": _message_id_from_tg_response(responses[0]) if responses else None,
-            "base_html": chunks[0] if chunks else "",
+            "main": {
+                "message_kind": "text",
+                "message_id": _message_id_from_tg_response(main_resp),
+                "base_html": chunks[0] if chunks else "",
+            },
+            "last": {
+                "message_kind": "text",
+                "message_id": _last_message_id_from_tg_response(last_resp),
+                "base_html": chunks[-1] if chunks else "",
+            },
         }
 
     chunks = format_chunks_for_send(post, limit=MAX_TG_CAPTION)
@@ -1232,34 +1253,63 @@ def send_post(cfg: Config, post: dict[str, Any]) -> dict[str, Any] | None:
 
     try:
         if len(photos) == 1:
-            resp = send_one_media(cfg, photos[0], caption=caption)
-            send_text_chunks(cfg, chunks, start_at=1)
+            media_resp = send_one_media(cfg, photos[0], caption=caption)
+            text_responses = send_text_chunks(cfg, chunks, start_at=1)
+            last_is_text = bool(text_responses)
+            last_resp = text_responses[-1] if text_responses else media_resp
             log(f"sent {'animation' if is_gif_url(photos[0]) else 'photo'} post #{pid}")
-            return {"message_kind": "caption", "message_id": _message_id_from_tg_response(resp), "base_html": caption}
+            return {
+                "main": {"message_kind": "caption", "message_id": _message_id_from_tg_response(media_resp), "base_html": caption},
+                "last": {
+                    "message_kind": "text" if last_is_text else "caption",
+                    "message_id": _last_message_id_from_tg_response(last_resp),
+                    "base_html": chunks[-1] if last_is_text else caption,
+                },
+            }
 
         # If there are GIFs mixed with photos, avoid mediaGroup: albums do not support
         # animation reliably. Send media one by one slowly.
         if any(is_gif_url(u) for u in photos):
             first_resp: dict[str, Any] | None = None
+            last_media_resp: dict[str, Any] | None = None
             for i, u in enumerate(photos):
                 resp = send_one_media(cfg, u, caption=caption if i == 0 else None)
                 if i == 0:
                     first_resp = resp
+                last_media_resp = resp
                 if cfg.media_item_delay > 0:
                     time.sleep(cfg.media_item_delay)
-            send_text_chunks(cfg, chunks, start_at=1)
+            text_responses = send_text_chunks(cfg, chunks, start_at=1)
+            last_is_text = bool(text_responses)
+            last_resp = text_responses[-1] if text_responses else (last_media_resp or first_resp or {})
             log(f"sent mixed media post #{pid} media={len(photos)}")
-            return {"message_kind": "caption", "message_id": _message_id_from_tg_response(first_resp or {}), "base_html": caption}
+            return {
+                "main": {"message_kind": "caption", "message_id": _message_id_from_tg_response(first_resp or {}), "base_html": caption},
+                "last": {
+                    "message_kind": "text" if last_is_text else "caption",
+                    "message_id": _last_message_id_from_tg_response(last_resp),
+                    "base_html": chunks[-1] if last_is_text else caption,
+                },
+            }
 
         # Telegram mediaGroup: max 10 items, caption only on the first item of the
         # first album. Additional albums carry only media; text continues below.
-        responses = send_photo_groups(cfg, photos, caption=caption)
-        send_text_chunks(cfg, chunks, start_at=1)
+        media_responses = send_photo_groups(cfg, photos, caption=caption)
+        text_responses = send_text_chunks(cfg, chunks, start_at=1)
+        last_is_text = bool(text_responses)
+        last_resp = text_responses[-1] if text_responses else (media_responses[0] if media_responses else {})
         log(f"sent album post #{pid} photos={len(photos)}")
         return {
-            "message_kind": "caption",
-            "message_id": _message_id_from_tg_response(responses[0]) if responses else None,
-            "base_html": caption,
+            "main": {
+                "message_kind": "caption",
+                "message_id": _message_id_from_tg_response(media_responses[0]) if media_responses else None,
+                "base_html": caption,
+            },
+            "last": {
+                "message_kind": "text" if last_is_text else "caption",
+                "message_id": _last_message_id_from_tg_response(last_resp),
+                "base_html": chunks[-1] if last_is_text else caption,
+            },
         }
     except Exception as e:
         return send_media_fallback(cfg, post, e)
@@ -1308,14 +1358,21 @@ def send_new_posts(cfg: Config, con: sqlite3.Connection, posts_newest_first: lis
             if not cfg.dry_run:
                 mark_sent(con, p)
                 if sent_info:
-                    record_telegram_message(
-                        con,
-                        p,
-                        chat_id=str(cfg.telegram_chat_id),
-                        message_id=sent_info.get("message_id"),
-                        message_kind=str(sent_info.get("message_kind") or "text"),
-                        base_html=str(sent_info.get("base_html") or ""),
-                    )
+                    # New structured shape records both edit target (main) and
+                    # future discussion-comment target (last). Keep a fallback for
+                    # older tests/callers that may return the pre-structured shape.
+                    records = sent_info if "main" in sent_info else {"main": sent_info, "last": sent_info}
+                    for role in ("main", "last"):
+                        info = records.get(role) or {}
+                        record_telegram_message(
+                            con,
+                            p,
+                            chat_id=str(cfg.telegram_chat_id),
+                            message_id=info.get("message_id"),
+                            message_kind=str(info.get("message_kind") or "text"),
+                            base_html=str(info.get("base_html") or ""),
+                            role=role,
+                        )
             sent += 1
         except Exception as e:
             mark_failed(con, p, str(e))
