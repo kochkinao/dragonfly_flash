@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import hashlib
 import json
 import logging
 import os
@@ -46,6 +47,7 @@ TG_API = "https://api.telegram.org/bot{token}/{method}"
 MAX_TG_CAPTION = 1024
 MAX_TG_MESSAGE = 4096
 MAX_MEDIA_GROUP = 10
+STATS_FOOTER_RESERVE = 80
 PART_PLACEHOLDER_TOTAL = "999"
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_KEEP_SENT = 50_000
@@ -322,6 +324,36 @@ def init_db(path: Path) -> sqlite3.Connection:
         )
         """
     )
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS telegram_messages (
+            post_id INTEGER NOT NULL,
+            role TEXT NOT NULL DEFAULT 'main',
+            chat_id TEXT NOT NULL,
+            message_id INTEGER NOT NULL,
+            message_kind TEXT NOT NULL,
+            base_html TEXT NOT NULL,
+            base_hash TEXT NOT NULL,
+            last_likes INTEGER,
+            last_comments INTEGER,
+            last_synced_at TEXT,
+            can_edit INTEGER NOT NULL DEFAULT 1,
+            last_error TEXT,
+            PRIMARY KEY(post_id, role)
+        )
+        """
+    )
+    cols_tm = {row[1] for row in con.execute("PRAGMA table_info(telegram_messages)")}
+    for name, ddl in {
+        "base_hash": "ALTER TABLE telegram_messages ADD COLUMN base_hash TEXT NOT NULL DEFAULT ''",
+        "last_likes": "ALTER TABLE telegram_messages ADD COLUMN last_likes INTEGER",
+        "last_comments": "ALTER TABLE telegram_messages ADD COLUMN last_comments INTEGER",
+        "last_synced_at": "ALTER TABLE telegram_messages ADD COLUMN last_synced_at TEXT",
+        "can_edit": "ALTER TABLE telegram_messages ADD COLUMN can_edit INTEGER NOT NULL DEFAULT 1",
+        "last_error": "ALTER TABLE telegram_messages ADD COLUMN last_error TEXT",
+    }.items():
+        if name not in cols_tm:
+            con.execute(ddl)
     con.commit()
     return con
 
@@ -352,6 +384,148 @@ def mark_sent(con: sqlite3.Connection, post: dict[str, Any]) -> None:
             post.get("author_name"),
             1 if post.get("photos") else 0,
         ),
+    )
+    con.commit()
+
+
+def _html_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _message_id_from_result(result: Any) -> int | None:
+    if isinstance(result, dict):
+        value = result.get("message_id")
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def _message_id_from_tg_response(resp: dict[str, Any]) -> int | None:
+    result = resp.get("result") if isinstance(resp, dict) else None
+    if isinstance(result, list) and result:
+        return _message_id_from_result(result[0])
+    return _message_id_from_result(result)
+
+
+def extract_post_stats(post: dict[str, Any]) -> tuple[int | None, int | None]:
+    def as_int(value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, list):
+            return len(value)
+        if isinstance(value, dict):
+            for key in ("count", "total", "total_count"):
+                if key in value:
+                    return as_int(value.get(key))
+            return None
+        try:
+            return int(str(value).strip())
+        except Exception:
+            return None
+
+    likes = None
+    comments = None
+    for key in ("likes_count", "like_count", "likes", "likes_total", "reactions_count"):
+        if key in post:
+            likes = as_int(post.get(key))
+            if likes is not None:
+                break
+    for key in ("comments_count", "comment_count", "comments", "comments_total", "replies_count"):
+        if key in post:
+            comments = as_int(post.get(key))
+            if comments is not None:
+                break
+    return likes, comments
+
+
+def stats_footer_html(likes: int | None, comments: int | None) -> str:
+    l = 0 if likes is None else int(likes)
+    c = 0 if comments is None else int(comments)
+    return f"❤️ {l}   💬 {c}"
+
+
+def append_stats_footer(base_html: str, likes: int | None, comments: int | None, *, limit: int) -> str | None:
+    footer = "\n\n" + stats_footer_html(likes, comments)
+    body = base_html.rstrip() + footer
+    if len(body) <= limit:
+        return body
+    return None
+
+
+def format_chunks_for_send(post: dict[str, Any], *, limit: int) -> list[str]:
+    safe_limit = max(1, limit - STATS_FOOTER_RESERVE)
+    return format_html_chunks(post, limit=safe_limit)
+
+
+def record_telegram_message(
+    con: sqlite3.Connection,
+    post: dict[str, Any],
+    *,
+    chat_id: str,
+    message_id: int | None,
+    message_kind: str,
+    base_html: str,
+    role: str = "main",
+) -> None:
+    if message_id is None:
+        return
+    likes, comments = extract_post_stats(post)
+    con.execute(
+        """
+        INSERT OR REPLACE INTO telegram_messages(
+            post_id, role, chat_id, message_id, message_kind, base_html, base_hash,
+            last_likes, last_comments, last_synced_at, can_edit, last_error
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL)
+        """,
+        (
+            int(post["post_id"]),
+            role,
+            str(chat_id),
+            int(message_id),
+            message_kind,
+            base_html,
+            _html_hash(base_html),
+            likes,
+            comments,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    con.commit()
+
+
+def get_main_telegram_message(con: sqlite3.Connection, post_id: int) -> sqlite3.Row | None:
+    old_factory = con.row_factory
+    con.row_factory = sqlite3.Row
+    try:
+        row = con.execute(
+            "SELECT * FROM telegram_messages WHERE post_id = ? AND role = 'main' AND can_edit = 1",
+            (int(post_id),),
+        ).fetchone()
+    finally:
+        con.row_factory = old_factory
+    return row
+
+
+def update_telegram_message_stats(con: sqlite3.Connection, post_id: int, likes: int | None, comments: int | None) -> None:
+    con.execute(
+        """
+        UPDATE telegram_messages
+        SET last_likes = ?, last_comments = ?, last_synced_at = ?, last_error = NULL
+        WHERE post_id = ? AND role = 'main'
+        """,
+        (likes, comments, datetime.now(timezone.utc).isoformat(), int(post_id)),
+    )
+    con.commit()
+
+
+def mark_telegram_message_uneditable(con: sqlite3.Connection, post_id: int, error: str) -> None:
+    con.execute(
+        "UPDATE telegram_messages SET can_edit = 0, last_error = ? WHERE post_id = ? AND role = 'main'",
+        (error[:1000], int(post_id)),
     )
     con.commit()
 
@@ -949,17 +1123,19 @@ def download_media_bytes(url: str, retries: int = 3) -> tuple[str, bytes, str]:
     raise RuntimeError(f"media download failed for {url}: {last_error}")
 
 
-def send_text_chunks(cfg: Config, chunks: list[str], *, start_at: int = 0) -> None:
+def send_text_chunks(cfg: Config, chunks: list[str], *, start_at: int = 0) -> list[dict[str, Any]]:
     chat_id = cfg.telegram_chat_id
+    responses: list[dict[str, Any]] = []
     for chunk in chunks[start_at:]:
-        tg_request(cfg, "sendMessage", {
+        responses.append(tg_request(cfg, "sendMessage", {
             "chat_id": chat_id,
             "text": chunk,
             "parse_mode": "HTML",
             "disable_web_page_preview": False,
-        })
+        }))
         if cfg.send_delay > 0:
             time.sleep(cfg.send_delay)
+    return responses
 
 
 def send_media_fallback(cfg: Config, post: dict[str, Any], error: Exception) -> None:
@@ -972,10 +1148,12 @@ def send_media_fallback(cfg: Config, post: dict[str, Any], error: Exception) -> 
         fallback["description"] = warning
     fallback["photos"] = []
     log(f"media fallback for post #{post.get('post_id')}: {error}")
-    send_text_chunks(cfg, format_html_chunks(fallback, limit=MAX_TG_MESSAGE))
+    chunks = format_chunks_for_send(fallback, limit=MAX_TG_MESSAGE)
+    responses = send_text_chunks(cfg, chunks)
+    return {"message_kind": "text", "message_id": _message_id_from_tg_response(responses[0]) if responses else None, "base_html": chunks[0] if chunks else ""}
 
 
-def send_one_media(cfg: Config, url: str, *, caption: str | None = None) -> None:
+def send_one_media(cfg: Config, url: str, *, caption: str | None = None) -> dict[str, Any]:
     chat_id = cfg.telegram_chat_id
     if is_gif_url(url):
         if cfg.upload_media:
@@ -984,31 +1162,29 @@ def send_one_media(cfg: Config, url: str, *, caption: str | None = None) -> None
             if caption:
                 fields["caption"] = caption
                 fields["parse_mode"] = "HTML"
-            tg_multipart_request(cfg, "sendAnimation", fields, {"animation": (filename, data, ctype)})
-        else:
-            payload: dict[str, Any] = {"chat_id": chat_id, "animation": url}
-            if caption:
-                payload["caption"] = caption
-                payload["parse_mode"] = "HTML"
-            tg_request(cfg, "sendAnimation", payload)
-    else:
-        if cfg.upload_media:
-            filename, data, ctype = download_media_bytes(url)
-            fields = {"chat_id": str(chat_id)}
-            if caption:
-                fields["caption"] = caption
-                fields["parse_mode"] = "HTML"
-            tg_multipart_request(cfg, "sendPhoto", fields, {"photo": (filename, data, ctype)})
-        else:
-            payload = {"chat_id": chat_id, "photo": url}
-            if caption:
-                payload["caption"] = caption
-                payload["parse_mode"] = "HTML"
-            tg_request(cfg, "sendPhoto", payload)
+            return tg_multipart_request(cfg, "sendAnimation", fields, {"animation": (filename, data, ctype)})
+        payload: dict[str, Any] = {"chat_id": chat_id, "animation": url}
+        if caption:
+            payload["caption"] = caption
+            payload["parse_mode"] = "HTML"
+        return tg_request(cfg, "sendAnimation", payload)
+    if cfg.upload_media:
+        filename, data, ctype = download_media_bytes(url)
+        fields = {"chat_id": str(chat_id)}
+        if caption:
+            fields["caption"] = caption
+            fields["parse_mode"] = "HTML"
+        return tg_multipart_request(cfg, "sendPhoto", fields, {"photo": (filename, data, ctype)})
+    payload = {"chat_id": chat_id, "photo": url}
+    if caption:
+        payload["caption"] = caption
+        payload["parse_mode"] = "HTML"
+    return tg_request(cfg, "sendPhoto", payload)
 
 
-def send_photo_groups(cfg: Config, photos: list[str], *, caption: str | None = None) -> None:
+def send_photo_groups(cfg: Config, photos: list[str], *, caption: str | None = None) -> list[dict[str, Any]]:
     chat_id = cfg.telegram_chat_id
+    responses: list[dict[str, Any]] = []
     for group_index, start in enumerate(range(0, len(photos), MAX_MEDIA_GROUP)):
         group = photos[start:start + MAX_MEDIA_GROUP]
         media = []
@@ -1026,54 +1202,67 @@ def send_photo_groups(cfg: Config, photos: list[str], *, caption: str | None = N
                 item["parse_mode"] = "HTML"
             media.append(item)
         if cfg.upload_media:
-            tg_multipart_request(cfg, "sendMediaGroup", {"chat_id": str(chat_id), "media": json.dumps(media, ensure_ascii=False)}, files)
+            responses.append(tg_multipart_request(cfg, "sendMediaGroup", {"chat_id": str(chat_id), "media": json.dumps(media, ensure_ascii=False)}, files))
         else:
-            tg_request(cfg, "sendMediaGroup", {"chat_id": chat_id, "media": media})
+            responses.append(tg_request(cfg, "sendMediaGroup", {"chat_id": chat_id, "media": media}))
         if cfg.media_item_delay > 0 and start + MAX_MEDIA_GROUP < len(photos):
             time.sleep(cfg.media_item_delay)
+    return responses
 
 
-def send_post(cfg: Config, post: dict[str, Any]) -> None:
+def send_post(cfg: Config, post: dict[str, Any]) -> dict[str, Any] | None:
     pid = int(post["post_id"])
     photos = photo_urls(post)
     if not is_publishable(post):
         log(f"skipped empty post #{pid}")
-        return
+        return None
 
     if not photos:
-        send_text_chunks(cfg, format_html_chunks(post, limit=MAX_TG_MESSAGE))
+        chunks = format_chunks_for_send(post, limit=MAX_TG_MESSAGE)
+        responses = send_text_chunks(cfg, chunks)
         log(f"sent text post #{pid}")
-        return
+        return {
+            "message_kind": "text",
+            "message_id": _message_id_from_tg_response(responses[0]) if responses else None,
+            "base_html": chunks[0] if chunks else "",
+        }
 
-    chunks = format_html_chunks(post, limit=MAX_TG_CAPTION)
+    chunks = format_chunks_for_send(post, limit=MAX_TG_CAPTION)
     caption = chunks[0]
 
     try:
         if len(photos) == 1:
-            send_one_media(cfg, photos[0], caption=caption)
+            resp = send_one_media(cfg, photos[0], caption=caption)
             send_text_chunks(cfg, chunks, start_at=1)
             log(f"sent {'animation' if is_gif_url(photos[0]) else 'photo'} post #{pid}")
-            return
+            return {"message_kind": "caption", "message_id": _message_id_from_tg_response(resp), "base_html": caption}
 
         # If there are GIFs mixed with photos, avoid mediaGroup: albums do not support
         # animation reliably. Send media one by one slowly.
         if any(is_gif_url(u) for u in photos):
+            first_resp: dict[str, Any] | None = None
             for i, u in enumerate(photos):
-                send_one_media(cfg, u, caption=caption if i == 0 else None)
+                resp = send_one_media(cfg, u, caption=caption if i == 0 else None)
+                if i == 0:
+                    first_resp = resp
                 if cfg.media_item_delay > 0:
                     time.sleep(cfg.media_item_delay)
             send_text_chunks(cfg, chunks, start_at=1)
             log(f"sent mixed media post #{pid} media={len(photos)}")
-            return
+            return {"message_kind": "caption", "message_id": _message_id_from_tg_response(first_resp or {}), "base_html": caption}
 
         # Telegram mediaGroup: max 10 items, caption only on the first item of the
         # first album. Additional albums carry only media; text continues below.
-        send_photo_groups(cfg, photos, caption=caption)
+        responses = send_photo_groups(cfg, photos, caption=caption)
         send_text_chunks(cfg, chunks, start_at=1)
         log(f"sent album post #{pid} photos={len(photos)}")
+        return {
+            "message_kind": "caption",
+            "message_id": _message_id_from_tg_response(responses[0]) if responses else None,
+            "base_html": caption,
+        }
     except Exception as e:
-        send_media_fallback(cfg, post, e)
-
+        return send_media_fallback(cfg, post, e)
 
 def delay_for_post(cfg: Config, post: dict[str, Any]) -> float:
     """Choose post-level delay by content type.
@@ -1115,9 +1304,18 @@ def send_new_posts(cfg: Config, con: sqlite3.Connection, posts_newest_first: lis
             log(f"marked seen #{pid}")
             continue
         try:
-            send_post(cfg, p)
+            sent_info = send_post(cfg, p)
             if not cfg.dry_run:
                 mark_sent(con, p)
+                if sent_info:
+                    record_telegram_message(
+                        con,
+                        p,
+                        chat_id=str(cfg.telegram_chat_id),
+                        message_id=sent_info.get("message_id"),
+                        message_kind=str(sent_info.get("message_kind") or "text"),
+                        base_html=str(sent_info.get("base_html") or ""),
+                    )
             sent += 1
         except Exception as e:
             mark_failed(con, p, str(e))
@@ -1268,6 +1466,111 @@ def cmd_auth_check(cfg: Config) -> int:
     return 0
 
 
+def edit_telegram_message(cfg: Config, *, chat_id: str, message_id: int, message_kind: str, html_body: str) -> None:
+    if message_kind == "text":
+        tg_request(cfg, "editMessageText", {
+            "chat_id": chat_id,
+            "message_id": int(message_id),
+            "text": html_body,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": False,
+        })
+    elif message_kind == "caption":
+        tg_request(cfg, "editMessageCaption", {
+            "chat_id": chat_id,
+            "message_id": int(message_id),
+            "caption": html_body,
+            "parse_mode": "HTML",
+        })
+    else:
+        raise RuntimeError(f"unsupported Telegram message kind: {message_kind}")
+
+
+def sync_post_stats(cfg: Config, con: sqlite3.Connection, post: dict[str, Any]) -> bool:
+    pid = int(post["post_id"])
+    likes, comments = extract_post_stats(post)
+    if likes is None and comments is None:
+        log(f"stats skip post #{pid}: counters missing", logging.DEBUG)
+        return False
+    row = get_main_telegram_message(con, pid)
+    if row is None:
+        log(f"stats skip post #{pid}: no Telegram message mapping", logging.DEBUG)
+        return False
+    old_likes = row["last_likes"]
+    old_comments = row["last_comments"]
+    if old_likes == likes and old_comments == comments:
+        return False
+    kind = str(row["message_kind"])
+    limit = MAX_TG_MESSAGE if kind == "text" else MAX_TG_CAPTION
+    html_body = append_stats_footer(str(row["base_html"]), likes, comments, limit=limit)
+    if html_body is None:
+        err = f"stats footer does not fit Telegram {kind} limit={limit}"
+        log(f"stats edit skip post #{pid}: {err}", logging.WARNING)
+        mark_telegram_message_uneditable(con, pid, err)
+        send_alert(cfg, "Не получилось обновить статистику поста", f"Пост #{pid}: {err}", level="warning")
+        return False
+    try:
+        edit_telegram_message(
+            cfg,
+            chat_id=str(row["chat_id"]),
+            message_id=int(row["message_id"]),
+            message_kind=kind,
+            html_body=html_body,
+        )
+    except Exception as e:
+        # Telegram can reject edits of old/unchanged/deleted messages. Keep it
+        # retryable except for obvious "message is not modified".
+        msg = str(e)
+        if "message is not modified" not in msg.lower():
+            log_exception(f"stats edit failed post #{pid}", e)
+            con.execute(
+                "UPDATE telegram_messages SET last_error = ? WHERE post_id = ? AND role = 'main'",
+                (msg[:1000], pid),
+            )
+            con.commit()
+            send_alert(cfg, "Ошибка обновления статистики", f"Пост #{pid}: {msg[:500]}", level="warning")
+            return False
+    update_telegram_message_stats(con, pid, likes, comments)
+    log(f"stats updated post #{pid}: likes {old_likes}->{likes}, comments {old_comments}->{comments}")
+    return True
+
+
+def cmd_sync_stats(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
+    old_limit = cfg.limit
+    cfg.limit = int(args.count)
+    try:
+        posts = fetch_recent_posts(cfg, int(args.count))
+    finally:
+        cfg.limit = old_limit
+    updated = 0
+    seen = 0
+    for p in posts[: int(args.count)]:
+        seen += 1
+        try:
+            if sync_post_stats(cfg, con, p):
+                updated += 1
+        except Exception as e:
+            log_exception(f"stats sync failed post #{p.get('post_id')}", e)
+    log(f"sync-stats done checked={seen} updated={updated}")
+    return 0
+
+
+def cmd_sync_stats_watch(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
+    log(f"sync-stats-watch started interval={args.interval}s count={args.count} dry_run={cfg.dry_run}")
+    while True:
+        try:
+            cmd_sync_stats(cfg, con, args)
+        except Exception as e:
+            log_exception("sync-stats-watch loop error", e)
+            send_alert(
+                cfg,
+                "Ошибка sync-stats-watch",
+                f"Мониторинг лайков/комментариев не остановлен: подожду {human_duration(args.interval)} и попробую снова. Причина: {str(e)[:500]}",
+                level="error",
+            )
+        time.sleep(float(args.interval))
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Dragonfly Flash feed to Telegram")
     p.add_argument("--env-file", default=None, help="load KEY=VALUE secrets from file before reading env")
@@ -1309,6 +1612,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--page-size", type=int, default=20)
     s.add_argument("--no-catch-up-gaps", dest="catch_up_gaps", action="store_false", default=True, help="disable exact /api/post/<id> gap catch-up")
     s.add_argument("--max-gap-scan", type=int, default=200, help="largest ID span to scan for missing posts per poll")
+
+    s = sub.add_parser("sync-stats", help="one-shot sync of likes/comments for recent posts already mapped to Telegram")
+    s.add_argument("--count", type=int, default=20, help="recent Dragonfly posts to inspect")
+
+    s = sub.add_parser("sync-stats-watch", help="poll likes/comments and edit Telegram posts forever")
+    s.add_argument("--count", type=int, default=20, help="recent Dragonfly posts to inspect per tick")
+    s.add_argument("--interval", type=float, default=60.0, help="seconds between stats sync ticks")
     return p
 
 
@@ -1356,6 +1666,10 @@ def main() -> int:
         return cmd_backfill(cfg, con, args)
     if args.cmd == "watch":
         return cmd_watch(cfg, con, args)
+    if args.cmd == "sync-stats":
+        return cmd_sync_stats(cfg, con, args)
+    if args.cmd == "sync-stats-watch":
+        return cmd_sync_stats_watch(cfg, con, args)
     raise AssertionError(args.cmd)
 
 

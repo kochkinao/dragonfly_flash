@@ -181,6 +181,38 @@ python3 dragonfly_telegram_poster.py \
 python3 test_dragonfly_telegram_poster.py
 ```
 
+## Мониторинг лайков/комментариев
+
+Скрипт умеет обновлять уже опубликованные Telegram-посты статистикой Dragonfly:
+
+```text
+❤️ 12   💬 4
+```
+
+Как это работает:
+
+- при отправке нового поста сохраняется mapping `Dragonfly post_id -> Telegram message_id`;
+- сохраняется базовый HTML первого сообщения/первой caption;
+- `sync-stats` берёт последние N постов из `/api/feed`, читает `likes_count` и `comments_count`;
+- если счётчики изменились — редактирует Telegram-сообщение через `editMessageText` или `editMessageCaption`;
+- старые посты без сохранённого `message_id` пропускаются.
+
+Один проход:
+
+```bash
+python3 dragonfly_telegram_poster.py \
+  --env-file /home/wacotal/dragonfly.env \
+  sync-stats --count 20
+```
+
+Постоянный мониторинг раз в минуту:
+
+```bash
+python3 dragonfly_telegram_poster.py \
+  --env-file /home/wacotal/dragonfly.env \
+  sync-stats-watch --count 20 --interval 60
+```
+
 ## Загрузка треков в Dragonfly
 
 Для массовой загрузки аудио есть отдельный скрипт:

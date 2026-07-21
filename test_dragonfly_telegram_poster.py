@@ -597,6 +597,60 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertIn('>#123</a>', calls[-1][1]['text'])
         self.assertNotIn('Открыть пост', calls[-1][1]['text'])
 
+    def test_send_new_posts_records_telegram_message_mapping(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        calls = []
+        orig = poster.tg_request
+        orig_sleep = poster.time.sleep
+
+        def fake_tg_request(cfg, method, payload):
+            calls.append((method, payload))
+            return {'ok': True, 'result': {'message_id': 4242}}
+
+        poster.tg_request = fake_tg_request
+        poster.time.sleep = lambda *_: None
+        try:
+            n = poster.send_new_posts(c, con, [post(post_id=888, description='hello', likes_count=2, comments_count=1)])
+        finally:
+            poster.tg_request = orig
+            poster.time.sleep = orig_sleep
+
+        self.assertEqual(n, 1)
+        row = con.execute("SELECT message_id, message_kind, last_likes, last_comments FROM telegram_messages WHERE post_id=888").fetchone()
+        self.assertEqual(row, (4242, 'text', 2, 1))
+        self.assertEqual(calls[0][0], 'sendMessage')
+
+    def test_sync_post_stats_edits_text_when_counts_change(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        poster.mark_sent(con, post(post_id=889))
+        poster.record_telegram_message(
+            con,
+            post(post_id=889, likes_count=2, comments_count=1),
+            chat_id='@channel',
+            message_id=500,
+            message_kind='text',
+            base_html='base <b>html</b>',
+        )
+        calls = []
+        orig = poster.tg_request
+        poster.tg_request = lambda cfg, method, payload: calls.append((method, payload)) or {'ok': True, 'result': {'message_id': 500}}
+        try:
+            changed = poster.sync_post_stats(c, con, post(post_id=889, likes_count=3, comments_count=4))
+        finally:
+            poster.tg_request = orig
+
+        self.assertTrue(changed)
+        self.assertEqual(calls[0][0], 'editMessageText')
+        self.assertEqual(calls[0][1]['message_id'], 500)
+        self.assertIn('❤️ 3', calls[0][1]['text'])
+        self.assertIn('💬 4', calls[0][1]['text'])
+        row = con.execute("SELECT last_likes, last_comments FROM telegram_messages WHERE post_id=889").fetchone()
+        self.assertEqual(row, (3, 4))
+
     def test_failed_posts_stop_after_attempt_limit(self):
         con = poster.init_db(Path(':memory:'))
         p = post(post_id=777, description='text')
