@@ -863,6 +863,33 @@ class DragonflyPosterTests(unittest.TestCase):
         row = con.execute("SELECT last_likes, last_comments FROM telegram_messages WHERE post_id=889").fetchone()
         self.assertEqual(row, (3, 4))
 
+    def test_sync_post_stats_never_shows_fewer_comments_than_mirrored(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        poster.record_telegram_message(
+            con,
+            post(post_id=891, likes_count=1, comments_count=2),
+            chat_id='@channel',
+            message_id=501,
+            message_kind='text',
+            base_html='base',
+        )
+        for cid, msg_id in [(1, 901), (2, 902), (3, 903)]:
+            poster.mark_comment_sent(con, post_id=891, comment={'id': cid, 'username': 'u', 'text': str(cid)}, telegram_chat_id='-100', telegram_message_id=msg_id)
+        calls = []
+        orig = poster.tg_request
+        poster.tg_request = lambda cfg, method, payload: calls.append((method, payload)) or {'ok': True, 'result': {'message_id': 501}}
+        try:
+            changed = poster.sync_post_stats(c, con, post(post_id=891, likes_count=1, comments_count=2))
+        finally:
+            poster.tg_request = orig
+
+        self.assertTrue(changed)
+        self.assertIn('💬 3', calls[0][1]['text'])
+        row = con.execute("SELECT last_comments FROM telegram_messages WHERE post_id=891").fetchone()
+        self.assertEqual(row, (3,))
+
     def test_long_split_post_records_last_role_for_final_part(self):
         con = poster.init_db(Path(':memory:'))
         c = cfg()

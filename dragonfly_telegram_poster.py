@@ -1783,6 +1783,14 @@ def edit_telegram_message(cfg: Config, *, chat_id: str, message_id: int, message
 def sync_post_stats(cfg: Config, con: sqlite3.Connection, post: dict[str, Any]) -> bool:
     pid = int(post["post_id"])
     likes, comments = extract_post_stats(post)
+    mirrored_comments = con.execute(
+        "SELECT COUNT(*) FROM dragonfly_comments WHERE post_id = ? AND telegram_message_id IS NOT NULL",
+        (pid,),
+    ).fetchone()[0]
+    if comments is None:
+        comments = int(mirrored_comments) if mirrored_comments else None
+    elif mirrored_comments:
+        comments = max(int(comments), int(mirrored_comments))
     if likes is None and comments is None:
         log(f"stats skip post #{pid}: counters missing", logging.DEBUG)
         return False
