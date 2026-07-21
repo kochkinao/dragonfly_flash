@@ -1,11 +1,13 @@
 import importlib.util
 import io
+import json
 import sys
+import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
 
-SCRIPT = Path('/home/wacotal/dragonfly_telegram_poster.py')
+SCRIPT = Path(__file__).with_name('dragonfly_telegram_poster.py')
 spec = importlib.util.spec_from_file_location('poster', SCRIPT)
 poster = importlib.util.module_from_spec(spec)
 sys.modules['poster'] = poster
@@ -241,6 +243,81 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertEqual(len(alerts), 1)
         self.assertIn('Авторизация Dragonfly истекла', alerts[0])
         self.assertIn('401', alerts[0])
+
+    def test_accounts_file_switches_to_next_account_on_401(self):
+        c = cfg()
+        c.dragonfly_token = None
+        c.cookie_file = None
+        with tempfile.TemporaryDirectory() as td:
+            accounts_path = Path(td) / 'accounts.json'
+            accounts_path.write_text(json.dumps({
+                'active': 'main',
+                'accounts': [
+                    {'name': 'main', 'access_token': 'bad-token', 'enabled': True},
+                    {'name': 'backup', 'access_token': 'good-token', 'enabled': True},
+                ],
+            }), encoding='utf-8')
+            c.accounts_file = str(accounts_path)
+            poster.configure_active_account(c)
+            seen_auth = []
+            orig_urlopen = poster.urllib.request.urlopen
+
+            class Resp:
+                def __enter__(self): return self
+                def __exit__(self, *exc): return False
+                def read(self): return b'{"feed": [{"post_id": 1}]}'
+
+            def fake_urlopen(req, timeout):
+                seen_auth.append(req.get_header('Authorization'))
+                if 'bad-token' in (seen_auth[-1] or ''):
+                    raise urllib.error.HTTPError(req.full_url, 401, 'Unauthorized', {}, io.BytesIO(b'expired'))
+                return Resp()
+
+            poster.urllib.request.urlopen = fake_urlopen
+            try:
+                posts = poster.fetch_feed_page(c, 0)
+            finally:
+                poster.urllib.request.urlopen = orig_urlopen
+
+            self.assertEqual([p['post_id'] for p in posts], [1])
+            self.assertEqual(c.account_name, 'backup')
+            self.assertIn('bad-token', seen_auth[0])
+            self.assertIn('good-token', seen_auth[1])
+            saved = json.loads(accounts_path.read_text(encoding='utf-8'))
+            self.assertEqual(saved['active'], 'backup')
+
+    def test_accounts_file_does_not_switch_on_429(self):
+        c = cfg()
+        with tempfile.TemporaryDirectory() as td:
+            accounts_path = Path(td) / 'accounts.json'
+            accounts_path.write_text(json.dumps({
+                'active': 'main',
+                'accounts': [
+                    {'name': 'main', 'access_token': 'main-token', 'enabled': True},
+                    {'name': 'backup', 'access_token': 'backup-token', 'enabled': True},
+                ],
+            }), encoding='utf-8')
+            c.accounts_file = str(accounts_path)
+            c.cookie_file = None
+            poster.configure_active_account(c)
+            orig_urlopen = poster.urllib.request.urlopen
+            orig_sleep = poster.time.sleep
+
+            def fake_urlopen(req, timeout):
+                raise urllib.error.HTTPError(req.full_url, 429, 'Too Many Requests', {}, io.BytesIO(b'too many'))
+
+            poster.urllib.request.urlopen = fake_urlopen
+            poster.time.sleep = lambda *_: None
+            try:
+                with self.assertRaises(RuntimeError):
+                    poster.fetch_feed_page(c, 0)
+            finally:
+                poster.urllib.request.urlopen = orig_urlopen
+                poster.time.sleep = orig_sleep
+
+            self.assertEqual(c.account_name, 'main')
+            saved = json.loads(accounts_path.read_text(encoding='utf-8'))
+            self.assertEqual(saved['active'], 'main')
 
     def test_cmd_auth_check_returns_zero_when_feed_page_loads(self):
         c = cfg()

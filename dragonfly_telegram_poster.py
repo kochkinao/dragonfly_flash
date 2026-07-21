@@ -79,6 +79,8 @@ class Config:
     upload_media: bool
     alert_chat_id: str | None
     cookie_file: str | None
+    accounts_file: str | None = None
+    account_name: str | None = None
 
 
 LOGGER = logging.getLogger("dragonfly_telegram_poster")
@@ -185,6 +187,106 @@ def load_env_file(path: str | None) -> None:
         if key and key not in os.environ:
             os.environ[key] = value
 
+
+
+class DragonflyAuthExpired(RuntimeError):
+    """Raised when Dragonfly returns 401 for the active account."""
+
+
+def load_accounts_file(path: str | None) -> dict[str, Any] | None:
+    if not path:
+        return None
+    p = Path(path).expanduser()
+    if not p.exists():
+        raise SystemExit(f"Dragonfly accounts file not found: {p}")
+    data = json.loads(p.read_text(encoding="utf-8"))
+    accounts = data.get("accounts")
+    if not isinstance(accounts, list) or not accounts:
+        raise SystemExit(f"Dragonfly accounts file has no accounts: {p}")
+    return data
+
+
+def save_accounts_file(path: str, data: dict[str, Any]) -> None:
+    p = Path(path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, p)
+    try:
+        p.chmod(0o600)
+    except Exception:
+        pass
+
+
+def _enabled_accounts(data: dict[str, Any]) -> list[dict[str, Any]]:
+    return [a for a in data.get("accounts", []) if isinstance(a, dict) and a.get("enabled", True) and a.get("access_token")]
+
+
+def configure_active_account(cfg: Config) -> None:
+    """Load active account token from cfg.accounts_file into cfg.
+
+    Multi-account mode uses the token directly. It intentionally disables the
+    single cookie jar path for API calls, because one cookie jar cannot represent
+    multiple accounts safely.
+    """
+    data = load_accounts_file(cfg.accounts_file)
+    if not data:
+        return
+    accounts = _enabled_accounts(data)
+    if not accounts:
+        raise SystemExit("Dragonfly accounts file has no enabled accounts")
+    active_name = data.get("active")
+    account = next((a for a in accounts if a.get("name") == active_name), accounts[0])
+    cfg.dragonfly_token = str(account["access_token"])
+    cfg.cookie_file = None
+    cfg.account_name = str(account.get("name") or account.get("sub") or "account")
+
+
+def switch_dragonfly_account(cfg: Config, reason: str) -> bool:
+    """Switch to the next enabled account after an auth failure.
+
+    Returns True if switched, False when no replacement exists. This is only for
+    auth failures such as 401, not for 429 rate limits.
+    """
+    if not cfg.accounts_file:
+        return False
+    data = load_accounts_file(cfg.accounts_file)
+    if not data:
+        return False
+    accounts = _enabled_accounts(data)
+    if len(accounts) <= 1:
+        return False
+    current = cfg.account_name or data.get("active")
+    now = datetime.now(timezone.utc).isoformat()
+    for a in data.get("accounts", []):
+        if isinstance(a, dict) and a.get("name") == current:
+            a["last_error"] = reason[:300]
+            a["last_failed_at"] = now
+    names = [str(a.get("name") or a.get("sub") or i) for i, a in enumerate(accounts)]
+    try:
+        start = names.index(str(current)) + 1
+    except ValueError:
+        start = 0
+    for i in range(len(accounts)):
+        candidate = accounts[(start + i) % len(accounts)]
+        name = str(candidate.get("name") or candidate.get("sub") or "account")
+        if name == current:
+            continue
+        data["active"] = name
+        save_accounts_file(cfg.accounts_file, data)
+        old = cfg.account_name or "unknown"
+        cfg.dragonfly_token = str(candidate["access_token"])
+        cfg.cookie_file = None
+        cfg.account_name = name
+        log(f"Dragonfly account switched {old} -> {name}: {reason}", logging.WARNING)
+        send_alert(
+            cfg,
+            "Dragonfly переключил аккаунт",
+            f"Аккаунт {old} получил ошибку авторизации. Переключился на {name}. Причина: {reason[:300]}",
+            level="warning",
+        )
+        return True
+    return False
 
 def init_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -361,7 +463,7 @@ def api_get_json(
                 msg = "Авторизация Dragonfly истекла. Сайт вернул 401: cookie/JWT больше не работает. Нужно обновить авторизацию, иначе новые посты получать не получится."
                 if auth_alert:
                     auth_alert(msg)
-                raise RuntimeError(f"HTTP 401 for {url}: {body[:500]}") from e
+                raise DragonflyAuthExpired(f"HTTP 401 for {url}: {body[:500]}") from e
             if e.code == 429 and attempt < retries:
                 retry_after = e.headers.get("Retry-After") if e.headers else None
                 sleep_for = min(DEFAULT_API_429_MAX_SLEEP, DEFAULT_API_429_BASE_SLEEP * (2 ** attempt))
@@ -389,16 +491,32 @@ def api_get_json(
     raise RuntimeError(f"Network error for {url}: {last_error}")
 
 
+
+def api_get_json_dragonfly(cfg: Config, url: str) -> dict[str, Any]:
+    attempts = 0
+    max_attempts = 1
+    if cfg.accounts_file:
+        data = load_accounts_file(cfg.accounts_file) or {}
+        max_attempts = max(1, len(_enabled_accounts(data)))
+    while True:
+        try:
+            return api_get_json(
+                url,
+                headers=dragonfly_headers(cfg),
+                alert=lambda msg: send_alert(cfg, "Dragonfly временно ограничил запросы", msg, level="warning"),
+                auth_alert=dragonfly_auth_alert(cfg),
+                opener=dragonfly_opener(cfg),
+            )
+        except DragonflyAuthExpired as e:
+            attempts += 1
+            if attempts >= max_attempts or not switch_dragonfly_account(cfg, str(e)):
+                raise
+            log(f"retrying Dragonfly request with account={cfg.account_name} url={url}", logging.WARNING)
+
 def fetch_feed_page(cfg: Config, offset: int) -> list[dict[str, Any]]:
     url = API_FEED.format(feed_type=cfg.feed_type, limit=cfg.limit, offset=offset)
     log(f"fetch feed page offset={offset} limit={cfg.limit} type={cfg.feed_type}", logging.DEBUG)
-    data = api_get_json(
-        url,
-        headers=dragonfly_headers(cfg),
-        alert=lambda msg: send_alert(cfg, "Dragonfly временно ограничил запросы", msg, level="warning"),
-        auth_alert=dragonfly_auth_alert(cfg),
-        opener=dragonfly_opener(cfg),
-    )
+    data = api_get_json_dragonfly(cfg, url)
     feed = data.get("feed") or []
     log(f"fetched feed page offset={offset} posts={len(feed)}", logging.DEBUG)
     return [p for p in feed if isinstance(p, dict) and isinstance(p.get("post_id"), int)]
@@ -408,13 +526,7 @@ def fetch_post_by_id(cfg: Config, post_id: int) -> dict[str, Any] | None:
     url = API_POST.format(post_id=int(post_id))
     log(f"fetch post by id #{post_id}", logging.DEBUG)
     try:
-        data = api_get_json(
-            url,
-            headers=dragonfly_headers(cfg),
-            alert=lambda msg: send_alert(cfg, "Dragonfly временно ограничил запросы", msg, level="warning"),
-            auth_alert=dragonfly_auth_alert(cfg),
-            opener=dragonfly_opener(cfg),
-        )
+        data = api_get_json_dragonfly(cfg, url)
     except RuntimeError as e:
         msg = str(e)
         if "HTTP 404" in msg or "HTTP 422" in msg:
@@ -1151,7 +1263,7 @@ def cmd_auth_check(cfg: Config) -> int:
     except Exception as e:
         log(f"auth-check failed: {e}", logging.ERROR)
         return 1
-    mode = "cookie" if cfg.cookie_file else "bearer-jwt"
+    mode = f"accounts:{cfg.account_name}" if cfg.accounts_file else ("cookie" if cfg.cookie_file else "bearer-jwt")
     log(f"auth-check OK mode={mode} sample_posts={len(posts)}")
     return 0
 
@@ -1179,6 +1291,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--url-media", action="store_true", help="send media as URLs instead of uploading downloaded bytes (not recommended for Dragonfly)")
     p.add_argument("--alert-chat-id", default=None, help="send user-friendly warnings/errors to this Telegram user/chat; env TELEGRAM_ALERT_CHAT_ID also works")
     p.add_argument("--cookie-file", default=None, help="Dragonfly Mozilla/Netscape cookie jar; env DRAGONFLY_COOKIE_FILE also works. Preferred over legacy JWT.")
+    p.add_argument("--accounts-file", default=None, help="JSON file with Dragonfly account tokens for 401/auth failover; env DRAGONFLY_ACCOUNTS_FILE also works.")
 
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("auth-check", help="check Dragonfly authentication and exit")
@@ -1227,9 +1340,11 @@ def main() -> int:
         upload_media=not bool(args.url_media),
         alert_chat_id=args.alert_chat_id or optional_env("TELEGRAM_ALERT_CHAT_ID"),
         cookie_file=args.cookie_file or optional_env("DRAGONFLY_COOKIE_FILE"),
+        accounts_file=args.accounts_file or optional_env("DRAGONFLY_ACCOUNTS_FILE"),
     )
+    configure_active_account(cfg)
     if not cfg.cookie_file and not cfg.dragonfly_token:
-        raise SystemExit("Set DRAGONFLY_COOKIE_FILE or DRAGONFLY_ACCESS_TOKEN")
+        raise SystemExit("Set DRAGONFLY_COOKIE_FILE, DRAGONFLY_ACCESS_TOKEN, or DRAGONFLY_ACCOUNTS_FILE")
     if not cfg.dry_run and (not cfg.telegram_token or not cfg.telegram_chat_id):
         raise SystemExit("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required unless --dry-run")
     con = init_db(cfg.db_path)

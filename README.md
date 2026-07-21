@@ -45,6 +45,8 @@ DRAGONFLY_COOKIE_FILE=/path/to/dragonfly_cookies.txt
 TELEGRAM_BOT_TOKEN=***
 TELEGRAM_CHAT_ID=@dragonfly_flash
 TELEGRAM_ALERT_CHAT_ID=123456789
+# Optional: account pool for 401/auth failover.
+DRAGONFLY_ACCOUNTS_FILE=/path/to/dragonfly_accounts.json
 ```
 
 `DRAGONFLY_ACCESS_TOKEN` — legacy JWT fallback. Текущий сайт Dragonfly уже использует HttpOnly-cookie сессии, поэтому надёжнее перейти на `DRAGONFLY_COOKIE_FILE`.
@@ -70,6 +72,28 @@ auth-check OK mode=bearer-jwt sample_posts=20
 ```
 
 Если Dragonfly вернёт `401`, скрипт отправит понятный alert в личку: авторизация истекла, нужно обновить cookie/JWT.
+
+### Несколько аккаунтов для failover
+
+Можно указать JSON-файл с несколькими Dragonfly `access_token`:
+
+```json
+{
+  "active": "main",
+  "accounts": [
+    {"name": "main", "access_token": "...", "enabled": true},
+    {"name": "backup_1", "access_token": "...", "enabled": true}
+  ]
+}
+```
+
+Подключение:
+
+```bash
+DRAGONFLY_ACCOUNTS_FILE=/path/to/dragonfly_accounts.json
+```
+
+В multi-account режиме скрипт использует активный аккаунт из JSON. Если Dragonfly вернул `401`, скрипт переключает `active` на следующий enabled-аккаунт, отправляет alert в личку и повторяет запрос. При `429` аккаунты не переключаются: используется adaptive backoff, чтобы не забанить весь пул.
 
 Для приватного канала вместо `@dragonfly_flash` нужен numeric chat_id.
 Бот должен быть добавлен в канал админом с правом публикации.
