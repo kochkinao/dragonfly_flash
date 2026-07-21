@@ -231,6 +231,34 @@ Dragonfly post_id + role=last -> discussion_message_id
 
 Это подготовка для зеркалирования комментариев: если Dragonfly-пост разбит на несколько Telegram-сообщений, комментарии нужно отправлять reply именно к `role=last`.
 
+## Зеркалирование комментариев Dragonfly
+
+Комментарии берутся из endpoint:
+
+```text
+/api/get_comments/<post_id>?user_id=<DRAGONFLY_USER_ID>
+```
+
+Первый проход по посту по умолчанию только помечает уже существующие комментарии как увиденные, чтобы не заспамить чат старыми комментариями. Новые комментарии после этого отправляются в discussion group ответом на `role=last`.
+
+Один проход:
+
+```bash
+python3 dragonfly_telegram_poster.py \
+  --env-file /home/wacotal/dragonfly.env \
+  sync-comments --count 20
+```
+
+Постоянный watcher:
+
+```bash
+python3 dragonfly_telegram_poster.py \
+  --env-file /home/wacotal/dragonfly.env \
+  sync-comments-watch --count 20 --interval 30
+```
+
+Если нужно отправить уже существующие комментарии тоже, добавьте `--send-existing`.
+
 ## Загрузка треков в Dragonfly
 
 Для массовой загрузки аудио есть отдельный скрипт:

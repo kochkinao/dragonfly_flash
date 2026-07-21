@@ -20,6 +20,7 @@ Dry-run examples:
 from __future__ import annotations
 
 import argparse
+import base64
 import html
 import hashlib
 import json
@@ -42,6 +43,7 @@ from typing import Any, Callable, Iterable
 BASE_URL = "https://dragonfly-flash.ru"
 API_FEED = BASE_URL + "/api/feed?type={feed_type}&limit={limit}&offset={offset}"
 API_POST = BASE_URL + "/api/post/{post_id}"
+API_COMMENTS = BASE_URL + "/api/get_comments/{post_id}?user_id={user_id}"
 DEFAULT_DB = Path.home() / ".hermes" / "state" / "dragonfly_telegram_poster.sqlite3"
 TG_API = "https://api.telegram.org/bot{token}/{method}"
 MAX_TG_CAPTION = 1024
@@ -60,6 +62,7 @@ DEFAULT_API_429_MAX_SLEEP = 900.0
 @dataclass
 class Config:
     dragonfly_token: str | None
+    dragonfly_user_id: str | None
     telegram_token: str | None
     telegram_chat_id: str | None
     db_path: Path
@@ -355,6 +358,22 @@ def init_db(path: Path) -> sqlite3.Connection:
             discussion_message_id INTEGER NOT NULL,
             found_at TEXT NOT NULL,
             PRIMARY KEY(post_id, role)
+        )
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dragonfly_comments (
+            post_id INTEGER NOT NULL,
+            comment_id INTEGER NOT NULL,
+            parent_id INTEGER,
+            user_id INTEGER,
+            username TEXT,
+            text_hash TEXT NOT NULL,
+            telegram_chat_id TEXT,
+            telegram_message_id INTEGER,
+            sent_at TEXT NOT NULL,
+            PRIMARY KEY(post_id, comment_id)
         )
         """
     )
@@ -846,6 +865,25 @@ def api_get_json_dragonfly(cfg: Config, url: str) -> dict[str, Any]:
             if attempts >= max_attempts or not switch_dragonfly_account(cfg, str(e)):
                 raise
             log(f"retrying Dragonfly request with account={cfg.account_name} url={url}", logging.WARNING)
+
+def _jwt_payload(token: str | None) -> dict[str, Any]:
+    if not token or token.count(".") < 2:
+        return {}
+    try:
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        return json.loads(base64.urlsafe_b64decode(part.encode()).decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def dragonfly_user_id(cfg: Config) -> str | None:
+    if cfg.dragonfly_user_id:
+        return str(cfg.dragonfly_user_id)
+    payload = _jwt_payload(cfg.dragonfly_token)
+    sub = payload.get("sub")
+    return str(sub) if sub is not None else None
+
 
 def fetch_feed_page(cfg: Config, offset: int) -> list[dict[str, Any]]:
     url = API_FEED.format(feed_type=cfg.feed_type, limit=cfg.limit, offset=offset)
@@ -1757,6 +1795,162 @@ def sync_post_stats(cfg: Config, con: sqlite3.Connection, post: dict[str, Any]) 
     return True
 
 
+def fetch_post_comments(cfg: Config, post_id: int) -> list[dict[str, Any]]:
+    uid = dragonfly_user_id(cfg)
+    if not uid:
+        raise RuntimeError("Dragonfly user_id is required for comments; set DRAGONFLY_USER_ID or use a JWT/account token with sub")
+    url = API_COMMENTS.format(post_id=int(post_id), user_id=urllib.parse.quote(str(uid)))
+    data = api_get_json_dragonfly(cfg, url)
+    comments = data if isinstance(data, list) else data.get("comments", []) if isinstance(data, dict) else []
+    return [c for c in comments if isinstance(c, dict) and c.get("id") is not None]
+
+
+def get_discussion_message(con: sqlite3.Connection, post_id: int, role: str = "last") -> sqlite3.Row | None:
+    old_factory = con.row_factory
+    con.row_factory = sqlite3.Row
+    try:
+        row = con.execute(
+            "SELECT * FROM telegram_discussion_messages WHERE post_id = ? AND role = ?",
+            (int(post_id), role),
+        ).fetchone()
+    finally:
+        con.row_factory = old_factory
+    return row
+
+
+def is_comment_sent(con: sqlite3.Connection, post_id: int, comment_id: int) -> bool:
+    return con.execute(
+        "SELECT 1 FROM dragonfly_comments WHERE post_id = ? AND comment_id = ?",
+        (int(post_id), int(comment_id)),
+    ).fetchone() is not None
+
+
+def mark_comment_sent(
+    con: sqlite3.Connection,
+    *,
+    post_id: int,
+    comment: dict[str, Any],
+    telegram_chat_id: str | None,
+    telegram_message_id: int | None,
+) -> None:
+    cid = int(comment["id"])
+    parent = comment.get("parent_id")
+    user_id = comment.get("user_id")
+    con.execute(
+        """
+        INSERT OR REPLACE INTO dragonfly_comments(
+            post_id, comment_id, parent_id, user_id, username, text_hash,
+            telegram_chat_id, telegram_message_id, sent_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(post_id), cid,
+            int(parent) if parent is not None else None,
+            int(user_id) if user_id is not None else None,
+            str(comment.get("username") or ""),
+            _html_hash(str(comment.get("text") or "")),
+            str(telegram_chat_id) if telegram_chat_id is not None else None,
+            int(telegram_message_id) if telegram_message_id is not None else None,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    con.commit()
+
+
+def format_comment_html(comment: dict[str, Any], post_id: int) -> str:
+    username = comment.get("username") or f"user_{comment.get('user_id', '')}".strip("_") or "пользователь"
+    when = parse_time(str(comment.get("created_at") or ""))
+    text = escape_text(comment.get("text") or "")
+    if len(text) > 3000:
+        text = text[:2990].rstrip() + "…"
+    reply = "↪️ " if comment.get("parent_id") else ""
+    likes = int(comment.get("likes_count") or 0)
+    footer = f'\n\n❤️ {likes}   <a href="{escape_attr(post_url(int(post_id)))}">#{int(post_id)}</a>'
+    header = f"💬 {reply}<b>{escape_text(username)}</b>"
+    if when:
+        header += f" · <i>{escape_text(when)}</i>"
+    return f"{header}\n{text}{footer}"[:MAX_TG_MESSAGE]
+
+
+def send_comment_to_discussion(cfg: Config, target: sqlite3.Row, text: str) -> int | None:
+    payload = {
+        "chat_id": str(target["discussion_chat_id"]),
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+        "reply_to_message_id": int(target["discussion_message_id"]),
+        "allow_sending_without_reply": True,
+    }
+    resp = tg_request(cfg, "sendMessage", payload)
+    return _message_id_from_tg_response(resp)
+
+
+def sync_post_comments(cfg: Config, con: sqlite3.Connection, post: dict[str, Any], *, send_existing: bool = False) -> tuple[int, int]:
+    pid = int(post["post_id"])
+    target = get_discussion_message(con, pid, "last")
+    if target is None:
+        return (0, 0)
+    comments = fetch_post_comments(cfg, pid)
+    comments.sort(key=lambda c: int(c.get("id") or 0))
+    known_any = con.execute("SELECT 1 FROM dragonfly_comments WHERE post_id = ? LIMIT 1", (pid,)).fetchone() is not None
+    sent = 0
+    marked = 0
+    for c in comments:
+        try:
+            cid = int(c["id"])
+        except Exception:
+            continue
+        if is_comment_sent(con, pid, cid):
+            continue
+        # On first observation of a post, seed existing comments silently to avoid
+        # flooding the discussion group with old Dragonfly comments.
+        if not send_existing and not known_any:
+            mark_comment_sent(con, post_id=pid, comment=c, telegram_chat_id=None, telegram_message_id=None)
+            marked += 1
+            continue
+        msg_id = send_comment_to_discussion(cfg, target, format_comment_html(c, pid))
+        mark_comment_sent(con, post_id=pid, comment=c, telegram_chat_id=str(target["discussion_chat_id"]), telegram_message_id=msg_id)
+        sent += 1
+    if marked:
+        log(f"comments seeded post #{pid}: marked_existing={marked}")
+    if sent:
+        log(f"comments mirrored post #{pid}: sent={sent}")
+    return (sent, marked)
+
+
+def cmd_sync_comments(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
+    old_limit = cfg.limit
+    cfg.limit = int(args.count)
+    try:
+        posts = fetch_recent_posts(cfg, int(args.count))
+    finally:
+        cfg.limit = old_limit
+    total_sent = 0
+    total_marked = 0
+    checked = 0
+    for p in posts[: int(args.count)]:
+        checked += 1
+        try:
+            sent, marked = sync_post_comments(cfg, con, p, send_existing=bool(getattr(args, "send_existing", False)))
+            total_sent += sent
+            total_marked += marked
+        except Exception as e:
+            log_exception(f"comments sync failed post #{p.get('post_id')}", e)
+    log(f"sync-comments done checked={checked} sent={total_sent} marked_existing={total_marked}")
+    return 0
+
+
+def cmd_sync_comments_watch(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
+    log(f"sync-comments-watch started interval={args.interval}s count={args.count} dry_run={cfg.dry_run}")
+    while True:
+        try:
+            cmd_sync_comments(cfg, con, args)
+        except Exception as e:
+            log_exception("sync-comments-watch loop error", e)
+            send_alert(cfg, "Ошибка sync-comments-watch", f"Зеркалирование комментариев не остановлено: попробую снова через {human_duration(args.interval)}. Причина: {str(e)[:500]}", level="error")
+        time.sleep(float(args.interval))
+
+
 def cmd_sync_stats(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
     old_limit = cfg.limit
     cfg.limit = int(args.count)
@@ -1816,6 +2010,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--url-media", action="store_true", help="send media as URLs instead of uploading downloaded bytes (not recommended for Dragonfly)")
     p.add_argument("--alert-chat-id", default=None, help="send user-friendly warnings/errors to this Telegram user/chat; env TELEGRAM_ALERT_CHAT_ID also works")
     p.add_argument("--discussion-chat-id", default=None, help="linked Telegram discussion group id; env TELEGRAM_DISCUSSION_CHAT_ID also works")
+    p.add_argument("--dragonfly-user-id", default=None, help="Dragonfly user id for /api/get_comments; env DRAGONFLY_USER_ID also works")
     p.add_argument("--cookie-file", default=None, help="Dragonfly Mozilla/Netscape cookie jar; env DRAGONFLY_COOKIE_FILE also works. Preferred over legacy JWT.")
     p.add_argument("--accounts-file", default=None, help="JSON file with Dragonfly account tokens for 401/auth failover; env DRAGONFLY_ACCOUNTS_FILE also works.")
 
@@ -1842,6 +2037,15 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("sync-stats-watch", help="poll likes/comments and edit Telegram posts forever")
     s.add_argument("--count", type=int, default=20, help="recent Dragonfly posts to inspect per tick")
     s.add_argument("--interval", type=float, default=60.0, help="seconds between stats sync ticks")
+
+    s = sub.add_parser("sync-comments", help="one-shot mirror of new Dragonfly comments into Telegram discussion")
+    s.add_argument("--count", type=int, default=20, help="recent Dragonfly posts to inspect")
+    s.add_argument("--send-existing", action="store_true", help="send already existing comments too; default seeds existing comments silently on first observation")
+
+    s = sub.add_parser("sync-comments-watch", help="poll Dragonfly comments and mirror new ones forever")
+    s.add_argument("--count", type=int, default=20, help="recent Dragonfly posts to inspect per tick")
+    s.add_argument("--interval", type=float, default=30.0, help="seconds between comment sync ticks")
+    s.add_argument("--send-existing", action="store_true", help="send already existing comments too; default seeds existing comments silently on first observation")
     return p
 
 
@@ -1852,6 +2056,7 @@ def main() -> int:
     setup_logging(args.log_file or None, verbose=bool(args.verbose))
     cfg = Config(
         dragonfly_token=optional_env("DRAGONFLY_ACCESS_TOKEN"),
+        dragonfly_user_id=args.dragonfly_user_id or optional_env("DRAGONFLY_USER_ID"),
         telegram_token=optional_env("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=optional_env("TELEGRAM_CHAT_ID") or "@dragonfly_flash",
         db_path=Path(args.db),
@@ -1894,6 +2099,10 @@ def main() -> int:
         return cmd_sync_stats(cfg, con, args)
     if args.cmd == "sync-stats-watch":
         return cmd_sync_stats_watch(cfg, con, args)
+    if args.cmd == "sync-comments":
+        return cmd_sync_comments(cfg, con, args)
+    if args.cmd == "sync-comments-watch":
+        return cmd_sync_comments_watch(cfg, con, args)
     raise AssertionError(args.cmd)
 
 

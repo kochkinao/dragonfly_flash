@@ -17,6 +17,7 @@ spec.loader.exec_module(poster)
 def cfg():
     return poster.Config(
         dragonfly_token='df',
+        dragonfly_user_id='2723',
         telegram_token=None,
         telegram_chat_id='@channel',
         db_path=Path(':memory:'),
@@ -661,6 +662,44 @@ class DragonflyPosterTests(unittest.TestCase):
         row = con.execute("SELECT discussion_chat_id, discussion_message_id FROM telegram_discussion_messages WHERE post_id=901 AND role='last'").fetchone()
         self.assertEqual(row, ('-100222', 777))
         self.assertEqual(poster.kv_get(con, 'telegram_updates_offset'), '11')
+
+    def test_sync_comments_seeds_existing_then_sends_new_comment(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        c.telegram_token = 'tg'
+        poster.save_discussion_message(
+            con,
+            post_id=902,
+            role='last',
+            channel_chat_id='@channel',
+            channel_message_id=555,
+            discussion_chat_id='-100222',
+            discussion_message_id=777,
+        )
+        comments_round_1 = [{'id': 1, 'username': 'Alice', 'text': 'old', 'created_at': '2026-07-21T10:00:00', 'likes_count': 0}]
+        comments_round_2 = comments_round_1 + [{'id': 2, 'username': 'Bob', 'text': '<new>', 'created_at': '2026-07-21T10:01:00', 'likes_count': 3}]
+        calls = []
+        orig_fetch = poster.fetch_post_comments
+        orig_tg = poster.tg_request
+        poster.fetch_post_comments = lambda cfg, pid: comments_round_1
+        poster.tg_request = lambda cfg, method, payload: calls.append((method, payload)) or {'ok': True, 'result': {'message_id': 900}}
+        try:
+            sent, marked = poster.sync_post_comments(c, con, post(post_id=902), send_existing=False)
+            poster.fetch_post_comments = lambda cfg, pid: comments_round_2
+            sent2, marked2 = poster.sync_post_comments(c, con, post(post_id=902), send_existing=False)
+        finally:
+            poster.fetch_post_comments = orig_fetch
+            poster.tg_request = orig_tg
+
+        self.assertEqual((sent, marked), (0, 1))
+        self.assertEqual((sent2, marked2), (1, 0))
+        self.assertEqual(calls[0][0], 'sendMessage')
+        self.assertEqual(calls[0][1]['chat_id'], '-100222')
+        self.assertEqual(calls[0][1]['reply_to_message_id'], 777)
+        self.assertIn('&lt;new&gt;', calls[0][1]['text'])
+        rows = con.execute('SELECT comment_id, telegram_message_id FROM dragonfly_comments WHERE post_id=902 ORDER BY comment_id').fetchall()
+        self.assertEqual(rows, [(1, None), (2, 900)])
 
     def test_sync_post_stats_edits_text_when_counts_change(self):
         con = poster.init_db(Path(':memory:'))
