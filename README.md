@@ -180,3 +180,45 @@ python3 dragonfly_telegram_poster.py \
 ```bash
 python3 test_dragonfly_telegram_poster.py
 ```
+
+## Загрузка треков в Dragonfly
+
+Для массовой загрузки аудио есть отдельный скрипт:
+
+```bash
+python3 dragonfly_audio_uploader.py \
+  --env-file /home/wacotal/dragonfly.env \
+  --delay 5 \
+  --jitter 1 \
+  /path/to/music
+```
+
+Что делает:
+
+- отправляет `POST /api/audio/upload`;
+- multipart-поля как в браузере: `artist`, `title`, `file`;
+- берёт авторизацию из `DRAGONFLY_ACCOUNTS_FILE` / `DRAGONFLY_ACCESS_TOKEN`;
+- при `401` переключает аккаунт из пула;
+- при `429` ждёт backoff и повторяет;
+- поддерживает файлы, glob и директории;
+- по умолчанию понимает имена вида `Artist - Title.mp3`;
+- лимит размера по умолчанию: 25 MB.
+
+Проверить без загрузки:
+
+```bash
+python3 dragonfly_audio_uploader.py \
+  --env-file /home/wacotal/dragonfly.env \
+  --dry-run \
+  /path/to/music
+```
+
+Один файл с ручным artist/title:
+
+```bash
+python3 dragonfly_audio_uploader.py \
+  --env-file /home/wacotal/dragonfly.env \
+  --artist "Artist" \
+  --title "Track title" \
+  ./track.mp3
+```
