@@ -37,6 +37,7 @@ def cfg():
         log_file=None,
         upload_media=False,
         alert_chat_id=None,
+        discussion_chat_id=None,
         cookie_file=None,
     )
 
@@ -632,6 +633,34 @@ class DragonflyPosterTests(unittest.TestCase):
 
         self.assertIn('❤️ 0', calls[0][1]['text'])
         self.assertIn('💬 0', calls[0][1]['text'])
+
+    def test_discussion_mapping_detects_automatic_forward_update(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        c.telegram_token = 'tg'
+        c.discussion_chat_id = '-100222'
+        updates = [{
+            'update_id': 10,
+            'message': {
+                'message_id': 777,
+                'chat': {'id': -100222},
+                'is_automatic_forward': True,
+                'forward_from_chat': {'id': -100111},
+                'forward_from_message_id': 555,
+            },
+        }]
+        orig = poster.tg_request
+        poster.tg_request = lambda cfg, method, payload: {'ok': True, 'result': updates}
+        try:
+            did = poster.try_capture_discussion_mapping(c, con, post_id=901, role='last', channel_message_id=555, wait_seconds=0)
+        finally:
+            poster.tg_request = orig
+
+        self.assertEqual(did, 777)
+        row = con.execute("SELECT discussion_chat_id, discussion_message_id FROM telegram_discussion_messages WHERE post_id=901 AND role='last'").fetchone()
+        self.assertEqual(row, ('-100222', 777))
+        self.assertEqual(poster.kv_get(con, 'telegram_updates_offset'), '11')
 
     def test_sync_post_stats_edits_text_when_counts_change(self):
         con = poster.init_db(Path(':memory:'))

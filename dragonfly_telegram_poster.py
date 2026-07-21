@@ -80,6 +80,7 @@ class Config:
     log_file: str | None
     upload_media: bool
     alert_chat_id: str | None
+    discussion_chat_id: str | None
     cookie_file: str | None
     accounts_file: str | None = None
     account_name: str | None = None
@@ -343,6 +344,20 @@ def init_db(path: Path) -> sqlite3.Connection:
         )
         """
     )
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS telegram_discussion_messages (
+            post_id INTEGER NOT NULL,
+            role TEXT NOT NULL DEFAULT 'last',
+            channel_chat_id TEXT NOT NULL,
+            channel_message_id INTEGER NOT NULL,
+            discussion_chat_id TEXT NOT NULL,
+            discussion_message_id INTEGER NOT NULL,
+            found_at TEXT NOT NULL,
+            PRIMARY KEY(post_id, role)
+        )
+        """
+    )
     cols_tm = {row[1] for row in con.execute("PRAGMA table_info(telegram_messages)")}
     for name, ddl in {
         "base_hash": "ALTER TABLE telegram_messages ADD COLUMN base_hash TEXT NOT NULL DEFAULT ''",
@@ -551,6 +566,128 @@ def mark_telegram_message_uneditable(con: sqlite3.Connection, post_id: int, erro
         (error[:1000], int(post_id)),
     )
     con.commit()
+
+
+def kv_get(con: sqlite3.Connection, key: str) -> str | None:
+    row = con.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+    return str(row[0]) if row else None
+
+
+def kv_set(con: sqlite3.Connection, key: str, value: str) -> None:
+    con.execute("INSERT OR REPLACE INTO kv(key, value) VALUES(?, ?)", (key, value))
+    con.commit()
+
+
+def tg_get_updates(cfg: Config, con: sqlite3.Connection, *, timeout: int = 2) -> list[dict[str, Any]]:
+    if cfg.dry_run or not cfg.telegram_token:
+        return []
+    payload: dict[str, Any] = {"timeout": timeout, "allowed_updates": ["message", "channel_post"]}
+    offset_s = kv_get(con, "telegram_updates_offset")
+    if offset_s:
+        try:
+            payload["offset"] = int(offset_s)
+        except Exception:
+            pass
+    data = tg_request(cfg, "getUpdates", payload)
+    updates = data.get("result") if isinstance(data, dict) else []
+    if not isinstance(updates, list):
+        return []
+    max_update_id: int | None = None
+    clean = [u for u in updates if isinstance(u, dict)]
+    for upd in clean:
+        if isinstance(upd.get("update_id"), int):
+            max_update_id = max(max_update_id or 0, int(upd["update_id"]))
+    if max_update_id is not None:
+        kv_set(con, "telegram_updates_offset", str(max_update_id + 1))
+    return clean
+
+
+def _discussion_message_matches(msg: dict[str, Any], discussion_chat_id: str, channel_message_id: int) -> bool:
+    chat = msg.get("chat") or {}
+    if str(chat.get("id")) != str(discussion_chat_id):
+        return False
+    # Bot API legacy fields for automatic channel forwards.
+    if msg.get("forward_from_message_id") == channel_message_id:
+        return True
+    if msg.get("forward_from_message_id") or msg.get("is_automatic_forward"):
+        fchat = msg.get("forward_from_chat") or {}
+        if msg.get("forward_from_message_id") == channel_message_id and fchat:
+            return True
+    # Newer Bot API forward_origin shape.
+    origin = msg.get("forward_origin") or {}
+    if isinstance(origin, dict):
+        if origin.get("message_id") == channel_message_id:
+            return True
+        origin_chat = origin.get("chat") or {}
+        if origin_chat and msg.get("is_automatic_forward") and origin.get("message_id") == channel_message_id:
+            return True
+    return False
+
+
+def save_discussion_message(
+    con: sqlite3.Connection,
+    *,
+    post_id: int,
+    role: str,
+    channel_chat_id: str,
+    channel_message_id: int,
+    discussion_chat_id: str,
+    discussion_message_id: int,
+) -> None:
+    con.execute(
+        """
+        INSERT OR REPLACE INTO telegram_discussion_messages(
+            post_id, role, channel_chat_id, channel_message_id, discussion_chat_id, discussion_message_id, found_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(post_id), role, str(channel_chat_id), int(channel_message_id),
+            str(discussion_chat_id), int(discussion_message_id), datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    con.commit()
+
+
+def try_capture_discussion_mapping(
+    cfg: Config,
+    con: sqlite3.Connection,
+    *,
+    post_id: int,
+    role: str,
+    channel_message_id: int | None,
+    wait_seconds: float = 8.0,
+) -> int | None:
+    if not cfg.discussion_chat_id or not channel_message_id:
+        return None
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        try:
+            updates = tg_get_updates(cfg, con, timeout=2)
+        except Exception as e:
+            log(f"discussion mapping getUpdates failed post #{post_id}: {e}", logging.WARNING)
+            return None
+        for upd in updates:
+            msg = upd.get("message") or upd.get("channel_post") or {}
+            if not isinstance(msg, dict):
+                continue
+            if _discussion_message_matches(msg, str(cfg.discussion_chat_id), int(channel_message_id)):
+                did = msg.get("message_id")
+                if isinstance(did, int):
+                    save_discussion_message(
+                        con,
+                        post_id=int(post_id),
+                        role=role,
+                        channel_chat_id=str(cfg.telegram_chat_id),
+                        channel_message_id=int(channel_message_id),
+                        discussion_chat_id=str(cfg.discussion_chat_id),
+                        discussion_message_id=int(did),
+                    )
+                    log(f"discussion mapping saved post #{post_id} role={role} channel_message_id={channel_message_id} discussion_message_id={did}")
+                    return did
+        if time.monotonic() >= deadline:
+            log(f"discussion mapping not found yet post #{post_id} role={role} channel_message_id={channel_message_id}", logging.DEBUG)
+            return None
+        time.sleep(0.5)
 
 
 def mark_failed(con: sqlite3.Connection, post: dict[str, Any], error: str) -> None:
@@ -1381,6 +1518,7 @@ def send_new_posts(cfg: Config, con: sqlite3.Connection, posts_newest_first: lis
                     # future discussion-comment target (last). Keep a fallback for
                     # older tests/callers that may return the pre-structured shape.
                     records = sent_info if "main" in sent_info else {"main": sent_info, "last": sent_info}
+                    last_info = records.get("last") or records.get("main") or {}
                     for role in ("main", "last"):
                         info = records.get(role) or {}
                         record_telegram_message(
@@ -1392,6 +1530,14 @@ def send_new_posts(cfg: Config, con: sqlite3.Connection, posts_newest_first: lis
                             base_html=str(info.get("base_html") or ""),
                             role=role,
                         )
+                    try_capture_discussion_mapping(
+                        cfg,
+                        con,
+                        post_id=pid,
+                        role="last",
+                        channel_message_id=last_info.get("message_id"),
+                        wait_seconds=4.0,
+                    )
             sent += 1
         except Exception as e:
             mark_failed(con, p, str(e))
@@ -1669,6 +1815,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--verbose", action="store_true", help="enable debug logging")
     p.add_argument("--url-media", action="store_true", help="send media as URLs instead of uploading downloaded bytes (not recommended for Dragonfly)")
     p.add_argument("--alert-chat-id", default=None, help="send user-friendly warnings/errors to this Telegram user/chat; env TELEGRAM_ALERT_CHAT_ID also works")
+    p.add_argument("--discussion-chat-id", default=None, help="linked Telegram discussion group id; env TELEGRAM_DISCUSSION_CHAT_ID also works")
     p.add_argument("--cookie-file", default=None, help="Dragonfly Mozilla/Netscape cookie jar; env DRAGONFLY_COOKIE_FILE also works. Preferred over legacy JWT.")
     p.add_argument("--accounts-file", default=None, help="JSON file with Dragonfly account tokens for 401/auth failover; env DRAGONFLY_ACCOUNTS_FILE also works.")
 
@@ -1725,6 +1872,7 @@ def main() -> int:
         log_file=args.log_file or None,
         upload_media=not bool(args.url_media),
         alert_chat_id=args.alert_chat_id or optional_env("TELEGRAM_ALERT_CHAT_ID"),
+        discussion_chat_id=args.discussion_chat_id or optional_env("TELEGRAM_DISCUSSION_CHAT_ID"),
         cookie_file=args.cookie_file or optional_env("DRAGONFLY_COOKIE_FILE"),
         accounts_file=args.accounts_file or optional_env("DRAGONFLY_ACCOUNTS_FILE"),
     )

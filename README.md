@@ -45,6 +45,8 @@ DRAGONFLY_COOKIE_FILE=/path/to/dragonfly_cookies.txt
 TELEGRAM_BOT_TOKEN=***
 TELEGRAM_CHAT_ID=@dragonfly_flash
 TELEGRAM_ALERT_CHAT_ID=123456789
+# Optional: linked discussion group for future comment mirroring.
+TELEGRAM_DISCUSSION_CHAT_ID=-100xxxxxxxxxx
 # Optional: account pool for 401/auth failover.
 DRAGONFLY_ACCOUNTS_FILE=/path/to/dragonfly_accounts.json
 ```
@@ -212,6 +214,22 @@ python3 dragonfly_telegram_poster.py \
   --env-file /home/wacotal/dragonfly.env \
   sync-stats-watch --count 20 --interval 60
 ```
+
+## Telegram discussion group
+
+Если канал привязан к группе обсуждений, укажите её ID:
+
+```env
+TELEGRAM_DISCUSSION_CHAT_ID=-100xxxxxxxxxx
+```
+
+После отправки нового поста скрипт пробует через `getUpdates` найти автоматический forward Telegram в discussion group и сохраняет mapping:
+
+```text
+Dragonfly post_id + role=last -> discussion_message_id
+```
+
+Это подготовка для зеркалирования комментариев: если Dragonfly-пост разбит на несколько Telegram-сообщений, комментарии нужно отправлять reply именно к `role=last`.
 
 ## Загрузка треков в Dragonfly
 
