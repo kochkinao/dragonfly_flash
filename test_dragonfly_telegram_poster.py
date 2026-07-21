@@ -526,7 +526,7 @@ class DragonflyPosterTests(unittest.TestCase):
         orig_send = poster.send_post
         orig_sleep = poster.time.sleep
 
-        def fake_send(cfg, p):
+        def fake_send(cfg, p, **kwargs):
             sent.append(int(p['post_id']))
 
         poster.send_post = fake_send
@@ -559,7 +559,7 @@ class DragonflyPosterTests(unittest.TestCase):
             seen_fetches.append(pid)
             return post(post_id=pid, description=f'missing {pid}') if pid == 102 else None
 
-        def fake_send(cfg, p):
+        def fake_send(cfg, p, **kwargs):
             sent.append(int(p['post_id']))
 
         poster.fetch_post_by_id = fake_fetch
@@ -622,6 +622,34 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertIn('>#24974</a>', body)
         self.assertNotIn('post-header', body)
         self.assertNotIn('&lt;div', body)
+
+    def test_send_new_posts_retries_media_before_text_fallback(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        c.max_attempts = 3
+        calls = []
+        orig = poster.tg_request
+        orig_sleep = poster.time.sleep
+        def fake_tg_request(cfg, method, payload):
+            calls.append((method, payload))
+            if method in ('sendPhoto', 'sendAnimation', 'sendMediaGroup'):
+                raise RuntimeError('bad media')
+            return {'ok': True, 'result': {'message_id': 700}}
+        poster.tg_request = fake_tg_request
+        poster.time.sleep = lambda *_: None
+        try:
+            for _ in range(2):
+                poster.send_new_posts(c, con, [post(post_id=903, description='text', photos=[{'url': '/bad.jpg'}])])
+            self.assertFalse(poster.is_sent(con, 903))
+            self.assertEqual(poster.failed_attempts(con, 903), 2)
+            poster.send_new_posts(c, con, [post(post_id=903, description='text', photos=[{'url': '/bad.jpg'}])])
+        finally:
+            poster.tg_request = orig
+            poster.time.sleep = orig_sleep
+
+        self.assertTrue(poster.is_sent(con, 903))
+        self.assertTrue(any(method == 'sendMessage' and '⚠️ Медиа не отправилось' in payload.get('text', '') for method, payload in calls))
 
     def test_send_new_posts_records_telegram_message_mapping(self):
         con = poster.init_db(Path(':memory:'))
@@ -724,6 +752,38 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertIn('&lt;new&gt;', calls[0][1]['text'])
         rows = con.execute('SELECT comment_id, telegram_message_id FROM dragonfly_comments WHERE post_id=902 ORDER BY comment_id').fetchall()
         self.assertEqual(rows, [(1, None), (2, 900)])
+
+    def test_sync_comments_send_existing_posts_seeded_rows(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        c.telegram_token = 'tg'
+        poster.save_discussion_message(
+            con,
+            post_id=904,
+            role='last',
+            channel_chat_id='@channel',
+            channel_message_id=555,
+            discussion_chat_id='-100222',
+            discussion_message_id=777,
+        )
+        comment = {'id': 10, 'username': 'Alice', 'text': 'seeded', 'created_at': '2026-07-21T10:00:00', 'likes_count': 0}
+        poster.mark_comment_sent(con, post_id=904, comment=comment, telegram_chat_id=None, telegram_message_id=None)
+        calls = []
+        orig_fetch = poster.fetch_post_comments
+        orig_tg = poster.tg_request
+        poster.fetch_post_comments = lambda cfg, pid: [comment]
+        poster.tg_request = lambda cfg, method, payload: calls.append((method, payload)) or {'ok': True, 'result': {'message_id': 901}}
+        try:
+            sent, marked = poster.sync_post_comments(c, con, post(post_id=904), send_existing=True)
+        finally:
+            poster.fetch_post_comments = orig_fetch
+            poster.tg_request = orig_tg
+
+        self.assertEqual((sent, marked), (1, 0))
+        self.assertEqual(calls[0][1]['reply_to_message_id'], 777)
+        row = con.execute('SELECT telegram_message_id FROM dragonfly_comments WHERE post_id=904 AND comment_id=10').fetchone()
+        self.assertEqual(row, (901,))
 
     def test_sync_post_stats_edits_text_when_counts_change(self):
         con = poster.init_db(Path(':memory:'))

@@ -406,6 +406,16 @@ def is_exhausted(con: sqlite3.Connection, post_id: int, max_attempts: int) -> bo
     return bool(row and row[1] == "failed" and int(row[0]) >= max_attempts)
 
 
+def failed_attempts(con: sqlite3.Connection, post_id: int) -> int:
+    row = con.execute(
+        "SELECT failed_attempts, status FROM sent_posts WHERE post_id = ?",
+        (int(post_id),),
+    ).fetchone()
+    if not row or row[1] != "failed":
+        return 0
+    return int(row[0] or 0)
+
+
 def mark_sent(con: sqlite3.Connection, post: dict[str, Any]) -> None:
     con.execute(
         """
@@ -1427,7 +1437,7 @@ def send_photo_groups(cfg: Config, photos: list[str], *, caption: str | None = N
     return responses
 
 
-def send_post(cfg: Config, post: dict[str, Any]) -> dict[str, Any] | None:
+def send_post(cfg: Config, post: dict[str, Any], *, allow_fallback: bool = True) -> dict[str, Any] | None:
     pid = int(post["post_id"])
     photos = photo_urls(post)
     if not is_publishable(post):
@@ -1520,6 +1530,8 @@ def send_post(cfg: Config, post: dict[str, Any]) -> dict[str, Any] | None:
             },
         }
     except Exception as e:
+        if not allow_fallback:
+            raise
         return send_media_fallback(cfg, post, e)
 
 def delay_for_post(cfg: Config, post: dict[str, Any]) -> float:
@@ -1562,7 +1574,9 @@ def send_new_posts(cfg: Config, con: sqlite3.Connection, posts_newest_first: lis
             log(f"marked seen #{pid}")
             continue
         try:
-            sent_info = send_post(cfg, p)
+            attempts_before = failed_attempts(con, pid)
+            allow_fallback = attempts_before >= max(0, cfg.max_attempts - 1)
+            sent_info = send_post(cfg, p, allow_fallback=allow_fallback)
             if not cfg.dry_run:
                 mark_sent(con, p)
                 if sent_info:
@@ -1832,11 +1846,21 @@ def get_discussion_message(con: sqlite3.Connection, post_id: int, role: str = "l
     return row
 
 
+def get_comment_record(con: sqlite3.Connection, post_id: int, comment_id: int) -> sqlite3.Row | None:
+    old_factory = con.row_factory
+    con.row_factory = sqlite3.Row
+    try:
+        row = con.execute(
+            "SELECT * FROM dragonfly_comments WHERE post_id = ? AND comment_id = ?",
+            (int(post_id), int(comment_id)),
+        ).fetchone()
+    finally:
+        con.row_factory = old_factory
+    return row
+
+
 def is_comment_sent(con: sqlite3.Connection, post_id: int, comment_id: int) -> bool:
-    return con.execute(
-        "SELECT 1 FROM dragonfly_comments WHERE post_id = ? AND comment_id = ?",
-        (int(post_id), int(comment_id)),
-    ).fetchone() is not None
+    return get_comment_record(con, post_id, comment_id) is not None
 
 
 def mark_comment_sent(
@@ -1914,10 +1938,18 @@ def sync_post_comments(cfg: Config, con: sqlite3.Connection, post: dict[str, Any
             cid = int(c["id"])
         except Exception:
             continue
-        if is_comment_sent(con, pid, cid):
+        existing = get_comment_record(con, pid, cid)
+        if existing is not None:
+            if not send_existing or existing["telegram_message_id"] is not None:
+                continue
+            msg_id = send_comment_to_discussion(cfg, target, format_comment_html(c, pid))
+            mark_comment_sent(con, post_id=pid, comment=c, telegram_chat_id=str(target["discussion_chat_id"]), telegram_message_id=msg_id)
+            sent += 1
             continue
-        # On first observation of a post, seed existing comments silently to avoid
-        # flooding the discussion group with old Dragonfly comments.
+        # On first observation of a post, seed existing comments silently unless
+        # --send-existing is enabled. This avoids accidental old-comment floods;
+        # enabling --send-existing also sends previously seeded rows with NULL
+        # telegram_message_id.
         if not send_existing and not known_any:
             mark_comment_sent(con, post_id=pid, comment=c, telegram_chat_id=None, telegram_message_id=None)
             marked += 1
