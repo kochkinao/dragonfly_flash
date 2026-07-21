@@ -485,6 +485,10 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertTrue(all(len(payload['text']) <= poster.MAX_TG_MESSAGE for _, payload in calls))
         self.assertIn('(1/', calls[0][1]['text'])
         self.assertIn('(2/', calls[1][1]['text'])
+        self.assertNotIn('продолжение поста', calls[0][1]['text'])
+        self.assertTrue(calls[1][1]['text'].startswith('продолжение поста #123\n\n'))
+        self.assertNotIn('👤', calls[1][1]['text'].split('\n\n', 1)[0])
+        self.assertNotIn('🕒', calls[1][1]['text'].split('\n\n', 1)[0])
         self.assertIn('>#123</a>', calls[-1][1]['text'])
         self.assertNotIn('Открыть пост', calls[-1][1]['text'])
 
@@ -502,6 +506,9 @@ class DragonflyPosterTests(unittest.TestCase):
             limit = poster.MAX_TG_CAPTION if 'caption' in payload else poster.MAX_TG_MESSAGE
             self.assertLessEqual(len(body), limit)
         self.assertEqual(calls[-1][0], 'sendMessage')
+        self.assertTrue(calls[-1][1]['text'].startswith('продолжение поста #123\n\n'))
+        self.assertNotIn('👤', calls[-1][1]['text'].split('\n\n', 1)[0])
+        self.assertNotIn('🕒', calls[-1][1]['text'].split('\n\n', 1)[0])
         self.assertIn('>#123</a>', calls[-1][1]['text'])
         self.assertNotIn('Открыть пост', calls[-1][1]['text'])
 

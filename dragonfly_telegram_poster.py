@@ -1076,6 +1076,8 @@ def profile_url(post: dict[str, Any]) -> str | None:
 
 def post_header_html(post: dict[str, Any], *, continuation: bool = False) -> str:
     pid = int(post["post_id"])
+    if continuation:
+        return f"продолжение поста #{pid}"
     author = escape_text(post.get("author_name") or "Пользователь")
     created = escape_text(parse_time(post.get("created_at")))
     url = profile_url(post)
@@ -1086,8 +1088,6 @@ def post_header_html(post: dict[str, Any], *, continuation: bool = False) -> str
     lines: list[str] = [author_html]
     if created:
         lines.append(f"🕒 <i>{created}</i>")
-    if continuation:
-        lines.append(f"<i>продолжение поста #{pid}</i>")
     return "\n".join(lines)
 
 
@@ -1128,9 +1128,9 @@ def _largest_prefix_that_fits(raw: str, prefix: str, suffix: str, limit: int) ->
 def format_html_chunks(post: dict[str, Any], *, limit: int) -> list[str]:
     """Build one or more Telegram HTML messages/captions within a hard limit.
 
-    Each chunk contains author/time context. Non-final chunks end with a clear
-    continuation marker; the final chunk contains media/repost metadata and the
-    original post link.
+    First chunk contains author/time context. Continuation chunks start with only
+    `продолжение поста #...`; non-final chunks end with a clear part marker;
+    the final chunk contains media/repost metadata and the original post link.
     """
     raw_text = (post.get("description") or "").strip()
     meta = post_meta_html(post)
