@@ -25,6 +25,7 @@ import html
 import hashlib
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import sqlite3
@@ -55,6 +56,8 @@ PART_PLACEHOLDER_TOTAL = "999"
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_KEEP_SENT = 50_000
 DEFAULT_LOG_FILE = Path.home() / ".hermes" / "logs" / "dragonfly_telegram_poster.log"
+DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024
+DEFAULT_LOG_BACKUP_COUNT = 5
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 DEFAULT_API_429_BASE_SLEEP = 30.0
 DEFAULT_API_429_MAX_SLEEP = 900.0
@@ -115,7 +118,12 @@ def setup_logging(log_file: str | None = str(DEFAULT_LOG_FILE), verbose: bool = 
     if log_file:
         path = Path(log_file).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True)
-        fh = logging.FileHandler(path, encoding="utf-8")
+        fh = RotatingFileHandler(
+            path,
+            maxBytes=DEFAULT_LOG_MAX_BYTES,
+            backupCount=DEFAULT_LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(fmt)
         LOGGER.addHandler(fh)

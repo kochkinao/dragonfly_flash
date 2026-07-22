@@ -170,6 +170,14 @@ python3 dragonfly_telegram_poster.py --dry-run backfill --count 20
 ~/.hermes/state/dragonfly_telegram_poster.sqlite3
 ```
 
+Лог по умолчанию:
+
+```text
+~/.hermes/logs/dragonfly_telegram_poster.log
+```
+
+Лог ротируется автоматически: `10 MB × 5` backup-файлов, чтобы long-running watcher не раздувал один файл бесконечно.
+
 Можно указать другую:
 
 ```bash

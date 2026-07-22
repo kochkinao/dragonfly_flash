@@ -479,6 +479,19 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertIn('hello log file', text)
         self.assertIn('INFO', text)
 
+    def test_log_file_uses_rotation_limits(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            path = f.name
+        poster.setup_logging(path)
+        try:
+            handlers = [h for h in poster.LOGGER.handlers if getattr(h, 'baseFilename', None) == path]
+        finally:
+            poster.setup_logging(None)
+        self.assertEqual(len(handlers), 1)
+        self.assertEqual(handlers[0].maxBytes, poster.DEFAULT_LOG_MAX_BYTES)
+        self.assertEqual(handlers[0].backupCount, poster.DEFAULT_LOG_BACKUP_COUNT)
+
     def test_empty_post_without_text_or_media_is_not_publishable(self):
         self.assertFalse(poster.is_publishable(post(description='   ', photos=[])))
         self.assertTrue(poster.is_publishable(post(description='text', photos=[])))
