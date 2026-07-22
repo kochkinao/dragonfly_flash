@@ -51,6 +51,7 @@ DEFAULT_DB = Path.home() / ".hermes" / "state" / "dragonfly_telegram_poster.sqli
 TG_API = "https://api.telegram.org/bot{token}/{method}"
 MAX_TG_CAPTION = 1024
 MAX_TG_MESSAGE = 4096
+MAX_TG_PHOTO_BYTES = 10 * 1024 * 1024
 MAX_MEDIA_GROUP = 10
 STATS_FOOTER_RESERVE = 80
 PART_PLACEHOLDER_TOTAL = "999"
@@ -2118,6 +2119,20 @@ def send_media_fallback(cfg: Config, post: dict[str, Any], error: Exception) -> 
     }
 
 
+def is_telegram_photo_too_big_error(error: BaseException) -> bool:
+    text = str(error).lower()
+    return "too big for a photo" in text or "maximum size is 10485760" in text
+
+
+def send_media_document(cfg: Config, filename: str, data: bytes, ctype: str, *, caption: str | None = None) -> dict[str, Any]:
+    fields = {"chat_id": str(cfg.telegram_chat_id)}
+    if caption:
+        fields["caption"] = caption
+        fields["parse_mode"] = "HTML"
+    log(f"sending media as document filename={filename} bytes={len(data)} content_type={ctype}")
+    return tg_multipart_request(cfg, "sendDocument", fields, {"document": (filename, data, ctype)})
+
+
 def send_one_media(cfg: Config, url: str, *, caption: str | None = None) -> dict[str, Any]:
     chat_id = cfg.telegram_chat_id
     if is_gif_url(url):
@@ -2139,12 +2154,29 @@ def send_one_media(cfg: Config, url: str, *, caption: str | None = None) -> dict
         if caption:
             fields["caption"] = caption
             fields["parse_mode"] = "HTML"
-        return tg_multipart_request(cfg, "sendPhoto", fields, {"photo": (filename, data, ctype)})
+        if len(data) > MAX_TG_PHOTO_BYTES:
+            return send_media_document(cfg, filename, data, ctype, caption=caption)
+        try:
+            return tg_multipart_request(cfg, "sendPhoto", fields, {"photo": (filename, data, ctype)})
+        except RuntimeError as e:
+            if is_telegram_photo_too_big_error(e):
+                return send_media_document(cfg, filename, data, ctype, caption=caption)
+            raise
     payload = {"chat_id": chat_id, "photo": url}
     if caption:
         payload["caption"] = caption
         payload["parse_mode"] = "HTML"
-    return tg_request(cfg, "sendPhoto", payload)
+    try:
+        return tg_request(cfg, "sendPhoto", payload)
+    except RuntimeError as e:
+        if not is_telegram_photo_too_big_error(e):
+            raise
+        doc_payload: dict[str, Any] = {"chat_id": chat_id, "document": url}
+        if caption:
+            doc_payload["caption"] = caption
+            doc_payload["parse_mode"] = "HTML"
+        log(f"sending remote media as document after Telegram photo size rejection url={url}")
+        return tg_request(cfg, "sendDocument", doc_payload)
 
 
 def send_photo_groups(cfg: Config, photos: list[str], *, caption: str | None = None) -> list[dict[str, Any]]:

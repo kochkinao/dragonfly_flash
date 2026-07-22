@@ -828,6 +828,49 @@ class DragonflyPosterTests(unittest.TestCase):
         chunks = poster.format_html_chunks(p, limit=poster.MAX_TG_MESSAGE)
         self.assertIn('🎵 <b>Трек:</b> Импакт — Социопат', '\n'.join(chunks))
 
+    def test_large_uploaded_photo_is_sent_as_document_instead_of_retrying_photo(self):
+        c = cfg()
+        c.upload_media = True
+        calls = []
+        orig_download = poster.download_media_bytes
+        orig_multipart = poster.tg_multipart_request
+        poster.download_media_bytes = lambda _url: ('large.jpg', b'x' * (poster.MAX_TG_PHOTO_BYTES + 1), 'image/jpeg')
+        def fake_multipart(_cfg, method, fields, files):
+            calls.append((method, fields, files))
+            return {'ok': True, 'result': {'message_id': 801}}
+        poster.tg_multipart_request = fake_multipart
+        try:
+            resp = poster.send_one_media(c, 'https://dragonfly-flash.ru/photousers/large.jpg', caption='caption')
+        finally:
+            poster.download_media_bytes = orig_download
+            poster.tg_multipart_request = orig_multipart
+
+        self.assertEqual(resp['result']['message_id'], 801)
+        self.assertEqual(calls[0][0], 'sendDocument')
+        self.assertIn('document', calls[0][2])
+        self.assertEqual(calls[0][1]['caption'], 'caption')
+
+    def test_remote_photo_size_rejection_retries_as_document_url(self):
+        c = cfg()
+        c.upload_media = False
+        calls = []
+        orig = poster.tg_request
+        def fake_tg_request(_cfg, method, payload):
+            calls.append((method, payload))
+            if method == 'sendPhoto':
+                raise RuntimeError('Telegram HTTP 400: {"description":"Bad Request: file of size 15735769 bytes is too big for a photo; the maximum size is 10485760 bytes"}')
+            return {'ok': True, 'result': {'message_id': 802}}
+        poster.tg_request = fake_tg_request
+        try:
+            resp = poster.send_one_media(c, 'https://dragonfly-flash.ru/photousers/large.jpg', caption='caption')
+        finally:
+            poster.tg_request = orig
+
+        self.assertEqual(resp['result']['message_id'], 802)
+        self.assertEqual([m for m, _ in calls], ['sendPhoto', 'sendDocument'])
+        self.assertEqual(calls[1][1]['document'], 'https://dragonfly-flash.ru/photousers/large.jpg')
+        self.assertEqual(calls[1][1]['caption'], 'caption')
+
     def test_long_text_post_is_split_into_bounded_messages_with_continuation(self):
         long_text = 'абвгд ' * 900
         with CaptureTelegram() as calls:
