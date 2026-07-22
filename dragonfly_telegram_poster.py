@@ -1811,8 +1811,73 @@ def _basename(value: str) -> str:
     return Path(parsed.path or value).name
 
 
+def repost_parent(post: dict[str, Any]) -> dict[str, Any] | None:
+    parent = post.get("parent_post")
+    return parent if post.get("is_repost") and isinstance(parent, dict) else None
+
+
+def poll_info_html(post: dict[str, Any]) -> str:
+    poll = post.get("poll")
+    if not isinstance(poll, dict):
+        parent = repost_parent(post)
+        poll = parent.get("poll") if parent else None
+    if not isinstance(poll, dict):
+        return ""
+    question = str(poll.get("question") or "").strip()
+    options = poll.get("options") or []
+    if not question and not options:
+        return ""
+    lines = []
+    if question:
+        lines.append("📊 <b>Опрос:</b> " + escape_text(question))
+    if isinstance(options, list):
+        for idx, option in enumerate(options[:10], start=1):
+            if not isinstance(option, dict):
+                continue
+            text = str(option.get("text") or "").strip() or f"Вариант {idx}"
+            suffix = ""
+            percent = option.get("percent")
+            votes = option.get("votes")
+            details = []
+            if percent not in (None, ""):
+                details.append(f"{percent}%")
+            if votes not in (None, ""):
+                details.append(f"{votes}")
+            if details:
+                if len(details) == 2:
+                    suffix = f" — {details[0]} ({details[1]})"
+                else:
+                    suffix = f" — {details[0]}"
+            lines.append(f"{idx}. {escape_text(text)}{escape_text(suffix)}")
+    total = poll.get("total_votes")
+    if total not in (None, ""):
+        lines.append(f"Всего голосов: {escape_text(total)}")
+    return "\n".join(lines)
+
+
+def display_description(post: dict[str, Any]) -> str:
+    text = str(post.get("description") or "").strip()
+    parent = repost_parent(post)
+    if not parent:
+        return text
+    parent_author = str(parent.get("author_name") or "Пользователь").strip()
+    parent_created = parse_time(parent.get("created_at"))
+    parent_text = str(parent.get("description") or "").strip()
+    header = f"🔄 Репост: {parent_author}"
+    parent_url = profile_url(parent)
+    if parent_url:
+        header += f" ({parent_url})"
+    if parent_created:
+        header += f" · {parent_created}"
+    parts = [part for part in (text, header, parent_text) if part]
+    return "\n\n".join(parts)
+
+
 def audio_info_html(post: dict[str, Any]) -> str:
     audios = post.get("audios") or []
+    parent = repost_parent(post)
+    if (not isinstance(audios, list) or not audios) and parent:
+        audios = parent.get("audios") or []
     if not isinstance(audios, list) or not audios:
         return ""
     lines: list[str] = []
@@ -1843,9 +1908,9 @@ def audio_info_html(post: dict[str, Any]) -> str:
 
 
 def is_publishable(post: dict[str, Any]) -> bool:
-    """Return True when a post has text, visual media, or useful audio info."""
-    text = (post.get("description") or "").strip()
-    return bool(text or photo_urls(post) or audio_info_html(post))
+    """Return True when a post has text, visual media, poll data, or useful audio info."""
+    text = display_description(post).strip()
+    return bool(text or photo_urls(post) or audio_info_html(post) or poll_info_html(post))
 
 
 def profile_url(post: dict[str, Any]) -> str | None:
@@ -1854,6 +1919,8 @@ def profile_url(post: dict[str, Any]) -> str | None:
         return None
     if author_link.startswith("http://") or author_link.startswith("https://"):
         return author_link
+    if author_link.startswith("?"):
+        return BASE_URL + "/" + author_link
     return BASE_URL + "/?id=" + urllib.parse.quote(author_link.lstrip("/"), safe="")
 
 
@@ -1879,6 +1946,9 @@ def post_meta_html(post: dict[str, Any]) -> str:
     audio = audio_info_html(post)
     if audio:
         parts.append(audio)
+    poll = poll_info_html(post)
+    if poll:
+        parts.append(poll)
     if post.get("is_repost"):
         parts.append("🔄 репост")
     return "\n".join(parts)
@@ -1915,7 +1985,7 @@ def format_html_chunks(post: dict[str, Any], *, limit: int) -> list[str]:
     `продолжение поста #...`; non-final chunks end with a clear part marker;
     the final chunk contains media/repost metadata and the original post link.
     """
-    raw_text = (post.get("description") or "").strip()
+    raw_text = display_description(post).strip()
     meta = post_meta_html(post)
     final_suffix = ""
     if meta:
@@ -1970,7 +2040,13 @@ def format_html(post: dict[str, Any], *, caption: bool = False) -> str:
 
 def photo_urls(post: dict[str, Any]) -> list[str]:
     urls: list[str] = []
-    for ph in post.get("photos") or []:
+    photos = post.get("photos") or []
+    parent = repost_parent(post)
+    if (not isinstance(photos, list) or not photos) and parent:
+        photos = parent.get("photos") or []
+    for ph in photos:
+        if not isinstance(ph, dict):
+            continue
         u = abs_url(ph.get("url"))
         if u:
             urls.append(u)

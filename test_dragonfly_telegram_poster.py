@@ -352,6 +352,57 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual([method for method, _payload in calls], ['getUpdates'])
 
+    def test_public_community_repost_uses_parent_content_and_media(self):
+        rp = post(
+            post_id=29861,
+            author_name='laplace',
+            author_link='laplace',
+            description='',
+            photos=[],
+            is_repost=True,
+            parent_post={
+                'post_id': 29854,
+                'author_name': 'литературный клуб',
+                'author_link': '?community=myeyes',
+                'created_at': '2026-07-22T21:27:01.449448',
+                'description': 'Текст из паблика',
+                'photos': [{'url': '/photousers/x.png'}],
+                'audios': [],
+                'is_community_post': True,
+                'poll': None,
+            },
+        )
+        self.assertTrue(poster.is_publishable(rp))
+        self.assertEqual(poster.photo_urls(rp), ['https://dragonfly-flash.ru/photousers/x.png'])
+        html = poster.format_html(rp)
+        self.assertIn('🔄 Репост', html)
+        self.assertIn('литературный клуб', html)
+        self.assertIn('Текст из паблика', html)
+        self.assertIn('https://dragonfly-flash.ru/?community=myeyes', html)
+
+    def test_poll_only_post_is_publishable_and_renders_results(self):
+        poll_post = post(
+            description='',
+            photos=[],
+            poll={
+                'question': 'Объявлять ли сбор?',
+                'total_votes': 412,
+                'options': [
+                    {'text': 'Да', 'votes': 396, 'percent': 96},
+                    {'text': 'Нет', 'votes': 16, 'percent': 4},
+                ],
+            },
+        )
+        self.assertTrue(poster.is_publishable(poll_post))
+        html = poster.format_html(poll_post)
+        self.assertIn('📊 <b>Опрос:</b> Объявлять ли сбор?', html)
+        self.assertIn('1. Да — 96% (396)', html)
+        self.assertIn('Всего голосов: 412', html)
+
+    def test_community_author_link_keeps_query_url(self):
+        community_post = post(author_link='?community=myeyes')
+        self.assertEqual(poster.profile_url(community_post), 'https://dragonfly-flash.ru/?community=myeyes')
+
     def test_runtime_settings_apply_to_config_without_restart(self):
         con = poster.init_db(Path(':memory:'))
         c = cfg()
