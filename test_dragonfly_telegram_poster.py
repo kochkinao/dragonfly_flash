@@ -765,6 +765,41 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertEqual(row, ('-100222', 777))
         self.assertEqual(poster.kv_get(con, 'telegram_updates_offset'), '11')
 
+    def test_repair_discussion_mapping_recovers_missing_last_mapping(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        c.telegram_token = 'tg'
+        c.discussion_chat_id = '-100222'
+        poster.record_telegram_message(
+            con,
+            post(post_id=909),
+            chat_id='@channel',
+            message_id=556,
+            message_kind='text',
+            base_html='base',
+            role='last',
+        )
+        updates = [{
+            'update_id': 12,
+            'message': {
+                'message_id': 778,
+                'chat': {'id': -100222},
+                'is_automatic_forward': True,
+                'forward_origin': {'message_id': 556, 'chat': {'id': -100111}},
+            },
+        }]
+        orig = poster.tg_request
+        poster.tg_request = lambda cfg, method, payload: {'ok': True, 'result': updates}
+        try:
+            rc = poster.cmd_repair_discussion_mapping(c, con, type('Args', (), {'count': 10, 'wait_seconds': 0})())
+        finally:
+            poster.tg_request = orig
+
+        self.assertEqual(rc, 0)
+        row = con.execute("SELECT discussion_message_id FROM telegram_discussion_messages WHERE post_id=909 AND role='last'").fetchone()
+        self.assertEqual(row, (778,))
+
     def test_sync_comments_seeds_existing_then_sends_new_comment(self):
         con = poster.init_db(Path(':memory:'))
         c = cfg()

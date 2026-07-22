@@ -290,6 +290,16 @@ TELEGRAM_DISCUSSION_CHAT_ID=-100xxxxxxxxxx
 Dragonfly post_id + role=last -> discussion_message_id
 ```
 
+Если mapping не был пойман сразу, можно повторно пройти последние отсутствующие записи:
+
+```bash
+python3 dragonfly_telegram_poster.py \
+  --env-file /home/wacotal/dragonfly.env \
+  repair-discussion-mapping --count 200 --wait-seconds 0
+```
+
+Это полезно после временных `getUpdates` timeout'ов. Команда ищет `telegram_messages.role='last'` без строки в `telegram_discussion_messages` и пробует сопоставить их с доступными Telegram updates.
+
 Это подготовка для зеркалирования комментариев: если Dragonfly-пост разбит на несколько Telegram-сообщений, комментарии нужно отправлять reply именно к `role=last`.
 
 ## Зеркалирование комментариев Dragonfly

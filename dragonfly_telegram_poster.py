@@ -2267,6 +2267,47 @@ def sync_post_comments(cfg: Config, con: sqlite3.Connection, post: dict[str, Any
     return (sent, marked)
 
 
+def missing_discussion_mappings(con: sqlite3.Connection, *, count: int, role: str = "last") -> list[sqlite3.Row]:
+    old_factory = con.row_factory
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            """
+            SELECT tm.*
+            FROM telegram_messages tm
+            LEFT JOIN telegram_discussion_messages tdm
+              ON tdm.post_id = tm.post_id AND tdm.role = tm.role
+            WHERE tm.role = ? AND tdm.post_id IS NULL
+            ORDER BY tm.post_id DESC
+            LIMIT ?
+            """,
+            (str(role), int(count)),
+        ).fetchall()
+    finally:
+        con.row_factory = old_factory
+    return rows
+
+
+def cmd_repair_discussion_mapping(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
+    if not cfg.discussion_chat_id:
+        raise SystemExit("Set TELEGRAM_DISCUSSION_CHAT_ID or --discussion-chat-id")
+    rows = missing_discussion_mappings(con, count=int(args.count), role="last")
+    repaired = 0
+    for row in rows:
+        did = try_capture_discussion_mapping(
+            cfg,
+            con,
+            post_id=int(row["post_id"]),
+            role=str(row["role"]),
+            channel_message_id=int(row["message_id"]),
+            wait_seconds=float(getattr(args, "wait_seconds", 0)),
+        )
+        if did is not None:
+            repaired += 1
+    log(f"repair-discussion-mapping done checked={len(rows)} repaired={repaired}")
+    return 0
+
+
 def cmd_sync_comments(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
     old_limit = cfg.limit
     cfg.limit = int(args.count)
@@ -2412,6 +2453,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--interval", type=float, default=60.0, help="seconds between stats sync ticks")
     s.add_argument("--offset", type=int, default=0, help="Dragonfly feed offset; useful for sharding read-only watchers")
 
+    s = sub.add_parser("repair-discussion-mapping", help="retry mapping channel posts to Telegram discussion messages")
+    s.add_argument("--count", type=int, default=200, help="missing role=last mappings to inspect")
+    s.add_argument("--wait-seconds", type=float, default=0.0, help="seconds to wait for updates per missing mapping")
+
     s = sub.add_parser("sync-comments", help="one-shot mirror of new Dragonfly comments into Telegram discussion")
     s.add_argument("--count", type=int, default=20, help="recent Dragonfly posts to inspect")
     s.add_argument("--offset", type=int, default=0, help="Dragonfly feed offset; useful for sharding read-only watchers")
@@ -2490,6 +2535,8 @@ def main() -> int:
         return cmd_sync_stats(cfg, con, args)
     if args.cmd == "sync-stats-watch":
         return cmd_sync_stats_watch(cfg, con, args)
+    if args.cmd == "repair-discussion-mapping":
+        return cmd_repair_discussion_mapping(cfg, con, args)
     if args.cmd == "sync-comments":
         return cmd_sync_comments(cfg, con, args)
     if args.cmd == "sync-comments-watch":
