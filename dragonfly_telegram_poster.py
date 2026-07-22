@@ -2048,6 +2048,45 @@ def get_comment_record(con: sqlite3.Connection, post_id: int, comment_id: int) -
     return row
 
 
+def comment_counts(con: sqlite3.Connection, post_id: int) -> tuple[int, int]:
+    row = con.execute(
+        """
+        SELECT COUNT(*) AS known, SUM(CASE WHEN telegram_message_id IS NOT NULL THEN 1 ELSE 0 END) AS sent
+        FROM dragonfly_comments
+        WHERE post_id = ?
+        """,
+        (int(post_id),),
+    ).fetchone()
+    return (int(row[0] or 0), int(row[1] or 0))
+
+
+def has_unsent_seeded_comments(con: sqlite3.Connection, post_id: int) -> bool:
+    return con.execute(
+        "SELECT 1 FROM dragonfly_comments WHERE post_id = ? AND telegram_message_id IS NULL LIMIT 1",
+        (int(post_id),),
+    ).fetchone() is not None
+
+
+def should_fetch_post_comments(
+    con: sqlite3.Connection,
+    post: dict[str, Any],
+    *,
+    absolute_index: int,
+    hot_count: int,
+    send_existing: bool,
+) -> bool:
+    if int(absolute_index) < max(0, int(hot_count)):
+        return True
+    pid = int(post["post_id"])
+    if send_existing and has_unsent_seeded_comments(con, pid):
+        return True
+    _likes, feed_comments = extract_post_stats(post)
+    if feed_comments is None:
+        return True
+    known, _sent = comment_counts(con, pid)
+    return int(feed_comments) > known
+
+
 def is_comment_sent(con: sqlite3.Connection, post_id: int, comment_id: int) -> bool:
     return get_comment_record(con, post_id, comment_id) is not None
 
@@ -2163,9 +2202,19 @@ def cmd_sync_comments(cfg: Config, con: sqlite3.Connection, args: argparse.Names
     total_sent = 0
     total_marked = 0
     checked = 0
-    for p in posts[: int(args.count)]:
+    start_offset = int(getattr(args, "offset", 0))
+    hot_count = int(getattr(args, "hot_count", 20))
+    for idx, p in enumerate(posts[: int(args.count)]):
         checked += 1
         try:
+            if not should_fetch_post_comments(
+                con,
+                p,
+                absolute_index=start_offset + idx,
+                hot_count=hot_count,
+                send_existing=bool(getattr(args, "send_existing", False)),
+            ):
+                continue
             sent, marked = sync_post_comments(cfg, con, p, send_existing=bool(getattr(args, "send_existing", False)))
             total_sent += sent
             total_marked += marked
@@ -2205,6 +2254,12 @@ def cmd_sync_stats(cfg: Config, con: sqlite3.Connection, args: argparse.Namespac
         try:
             if sync_post_stats(cfg, con, p):
                 updated += 1
+            if cfg.best_chat_id:
+                try:
+                    sync_best_post(cfg, con, p)
+                except Exception as e:
+                    log_exception(f"best sync failed post #{p.get('post_id')}", e)
+                    send_alert(cfg, "Ошибка пересылки в Лучшее", f"Пост #{p.get('post_id')}: {str(e)[:500]}", level="warning")
         except Exception as e:
             log_exception(f"stats sync failed post #{p.get('post_id')}", e)
     log(f"sync-stats done checked={seen} updated={updated}")
@@ -2286,12 +2341,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--count", type=int, default=20, help="recent Dragonfly posts to inspect")
     s.add_argument("--offset", type=int, default=0, help="Dragonfly feed offset; useful for sharding read-only watchers")
     s.add_argument("--send-existing", action="store_true", help="send already existing comments too; default seeds existing comments silently on first observation")
+    s.add_argument("--hot-count", type=int, default=20, help="always fetch full comments for this many newest feed positions; older posts use comments_count gating")
 
     s = sub.add_parser("sync-comments-watch", help="poll Dragonfly comments and mirror new ones forever")
     s.add_argument("--count", type=int, default=20, help="recent Dragonfly posts to inspect per tick")
     s.add_argument("--interval", type=float, default=30.0, help="seconds between comment sync ticks")
     s.add_argument("--offset", type=int, default=0, help="Dragonfly feed offset; useful for sharding read-only watchers")
     s.add_argument("--send-existing", action="store_true", help="send already existing comments too; default seeds existing comments silently on first observation")
+    s.add_argument("--hot-count", type=int, default=20, help="always fetch full comments for this many newest feed positions; older posts use comments_count gating")
 
     s = sub.add_parser("sync-best", help="one-shot forward posts that reached the likes threshold to the best channel")
     s.add_argument("--count", type=int, default=50, help="recent Dragonfly posts to inspect")

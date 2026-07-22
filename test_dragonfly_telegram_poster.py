@@ -835,6 +835,89 @@ class DragonflyPosterTests(unittest.TestCase):
         row = con.execute('SELECT telegram_message_id FROM dragonfly_comments WHERE post_id=904 AND comment_id=10').fetchone()
         self.assertEqual(row, (901,))
 
+    def test_sync_comments_skips_old_post_when_feed_comment_count_unchanged(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        c.telegram_token = 'tg'
+        poster.save_discussion_message(
+            con,
+            post_id=906,
+            role='last',
+            channel_chat_id='@channel',
+            channel_message_id=555,
+            discussion_chat_id='-100222',
+            discussion_message_id=777,
+        )
+        poster.record_telegram_message(
+            con,
+            post(post_id=906, likes_count=1, comments_count=2),
+            chat_id='@channel',
+            message_id=500,
+            message_kind='text',
+            base_html='base',
+            role='main',
+        )
+        for cid, msg_id in [(1, 901), (2, 902)]:
+            poster.mark_comment_sent(con, post_id=906, comment={'id': cid, 'username': 'u', 'text': str(cid)}, telegram_chat_id='-100', telegram_message_id=msg_id)
+        fetch_calls = []
+        orig_fetch_posts = poster.fetch_recent_posts
+        orig_fetch_comments = poster.fetch_post_comments
+        poster.fetch_recent_posts = lambda cfg, count, start_offset=0: [post(post_id=906, likes_count=1, comments_count=2)]
+        poster.fetch_post_comments = lambda cfg, pid: fetch_calls.append(pid) or []
+        try:
+            rc = poster.cmd_sync_comments(c, con, type('Args', (), {'count': 1, 'offset': 20, 'send_existing': True, 'hot_count': 10})())
+        finally:
+            poster.fetch_recent_posts = orig_fetch_posts
+            poster.fetch_post_comments = orig_fetch_comments
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(fetch_calls, [])
+
+    def test_sync_comments_fetches_old_post_when_seeded_comment_unsent(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        c.telegram_token = 'tg'
+        poster.save_discussion_message(
+            con,
+            post_id=907,
+            role='last',
+            channel_chat_id='@channel',
+            channel_message_id=555,
+            discussion_chat_id='-100222',
+            discussion_message_id=777,
+        )
+        poster.record_telegram_message(
+            con,
+            post(post_id=907, likes_count=1, comments_count=1),
+            chat_id='@channel',
+            message_id=500,
+            message_kind='text',
+            base_html='base',
+            role='main',
+        )
+        comment = {'id': 21, 'username': 'Alice', 'text': 'seeded', 'created_at': '2026-07-21T10:00:00', 'likes_count': 0}
+        poster.mark_comment_sent(con, post_id=907, comment=comment, telegram_chat_id=None, telegram_message_id=None)
+        fetch_calls = []
+        tg_calls = []
+        orig_fetch_posts = poster.fetch_recent_posts
+        orig_fetch_comments = poster.fetch_post_comments
+        orig_tg = poster.tg_request
+        poster.fetch_recent_posts = lambda cfg, count, start_offset=0: [post(post_id=907, likes_count=1, comments_count=1)]
+        poster.fetch_post_comments = lambda cfg, pid: fetch_calls.append(pid) or [comment]
+        poster.tg_request = lambda cfg, method, payload: tg_calls.append((method, payload)) or {'ok': True, 'result': {'message_id': 903}}
+        try:
+            rc = poster.cmd_sync_comments(c, con, type('Args', (), {'count': 1, 'offset': 20, 'send_existing': True, 'hot_count': 10})())
+        finally:
+            poster.fetch_recent_posts = orig_fetch_posts
+            poster.fetch_post_comments = orig_fetch_comments
+            poster.tg_request = orig_tg
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(fetch_calls, [907])
+        self.assertEqual(tg_calls[0][0], 'sendMessage')
+
     def test_sync_comments_updates_stats_footer_after_sending_comment(self):
         con = poster.init_db(Path(':memory:'))
         c = cfg()
@@ -962,6 +1045,32 @@ class DragonflyPosterTests(unittest.TestCase):
         row = con.execute("SELECT last_likes, last_error FROM telegram_messages WHERE post_id=892").fetchone()
         self.assertEqual(row[0], 1)
         self.assertIn('handshake operation timed out', row[1])
+
+    def test_sync_stats_forwards_best_posts_when_configured(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        c.telegram_token = 'tg'
+        c.best_chat_id = '-100best'
+        c.best_likes_threshold = 7
+        poster.record_telegram_message(con, post(post_id=778, likes_count=6, comments_count=0), chat_id='@channel', message_id=110, message_kind='text', base_html='base', role='main')
+        calls = []
+        orig_fetch = poster.fetch_recent_posts
+        orig_tg = poster.tg_request
+        orig_sleep = poster.time.sleep
+        poster.fetch_recent_posts = lambda cfg, count, start_offset=0: [post(post_id=778, likes_count=8, comments_count=0)]
+        poster.tg_request = lambda cfg, method, payload: calls.append((method, payload)) or {'ok': True, 'result': {'message_id': 210}}
+        poster.time.sleep = lambda *_: None
+        try:
+            rc = poster.cmd_sync_stats(c, con, type('Args', (), {'count': 1, 'offset': 0})())
+        finally:
+            poster.fetch_recent_posts = orig_fetch
+            poster.tg_request = orig_tg
+            poster.time.sleep = orig_sleep
+
+        self.assertEqual(rc, 0)
+        self.assertEqual([m for m, _ in calls], ['editMessageText', 'forwardMessage'])
+        self.assertTrue(poster.is_best_post_sent(con, 778))
 
     def test_sync_best_post_forwards_once_and_records_dedupe(self):
         con = poster.init_db(Path(':memory:'))

@@ -237,8 +237,15 @@ python3 dragonfly_telegram_poster.py \
 python3 dragonfly_telegram_poster.py \
   --env-file /home/wacotal/dragonfly.env \
   --dragonfly-account backup_1 \
-  sync-stats-watch --count 50 --interval 30
+  sync-stats-watch --count 20 --offset 0 --interval 30
+
+python3 dragonfly_telegram_poster.py \
+  --env-file /home/wacotal/dragonfly.env \
+  --dragonfly-account backup_1 \
+  sync-stats-watch --count 30 --offset 20 --interval 60
 ```
+
+`sync-stats` также проверяет порог «Лучшего», если задан `TELEGRAM_BEST_CHAT_ID`, поэтому отдельный `sync-best-watch` не обязателен.
 
 `--offset` позволяет шардировать окна между несколькими read-only watcher'ами без пересечения.
 
@@ -308,7 +315,7 @@ python3 dragonfly_telegram_poster.py \
 ```bash
 python3 dragonfly_telegram_poster.py \
   --env-file /home/wacotal/dragonfly.env \
-  sync-comments-watch --count 20 --interval 30
+  sync-comments-watch --count 20 --interval 30 --hot-count 20
 ```
 
 Для отдельного read-only аккаунта и расширенного окна:
@@ -317,8 +324,20 @@ python3 dragonfly_telegram_poster.py \
 python3 dragonfly_telegram_poster.py \
   --env-file /home/wacotal/dragonfly.env \
   --dragonfly-account backup_2 \
-  sync-comments-watch --count 50 --interval 30 --send-existing
+  sync-comments-watch --count 17 --offset 0 --interval 30 --send-existing --hot-count 20
+
+python3 dragonfly_telegram_poster.py \
+  --env-file /home/wacotal/dragonfly.env \
+  --dragonfly-account backup_3 \
+  sync-comments-watch --count 17 --offset 17 --interval 30 --send-existing --hot-count 20
+
+python3 dragonfly_telegram_poster.py \
+  --env-file /home/wacotal/dragonfly.env \
+  --dragonfly-account backup_4 \
+  sync-comments-watch --count 16 --offset 34 --interval 30 --send-existing --hot-count 20
 ```
+
+Comments watcher использует gating: для постов вне `--hot-count` он не ходит в `/api/get_comments/<post_id>`, если feed `comments_count` не вырос и нет ранее seeded комментариев без Telegram `message_id`. Если новый комментарий всё-таки отправлен, watcher сразу обновляет stats footer этого поста, чтобы `💬` совпадал с discussion.
 
 Если нужно отправить уже существующие комментарии тоже, добавьте `--send-existing`.
 
