@@ -103,6 +103,7 @@ DRAGONFLY_ACCOUNTS_FILE=/secure/path/dragonfly_accounts.json
 
 ```text
 /panel
+/menu
 /start
 /help
 /status

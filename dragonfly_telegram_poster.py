@@ -1256,11 +1256,11 @@ def process_admin_update(cfg: Config, con: sqlite3.Connection, update: dict[str,
     if cmd == "/get" and len(parts) == 2:
         admin_reply(cfg, chat_id, f"{parts[1]} = {kv_get(con, runtime_setting_key(parts[1])) or 'default'}")
         return True
-    if cmd in {"/panel", "/start"}:
+    if cmd in {"/panel", "/start", "/menu"}:
         send_admin_panel(cfg, con, chat_id)
         return True
     if cmd in {"/help"}:
-        admin_reply(cfg, chat_id, "Команды: /panel, /status, /set <setting> <value>, /get <setting>. Настройки: " + ", ".join(sorted(RUNTIME_SETTING_META)))
+        admin_reply(cfg, chat_id, "Команды: /panel, /menu, /start, /status, /set <setting> <value>, /get <setting>. Настройки: " + ", ".join(sorted(RUNTIME_SETTING_META)))
         return True
     if cmd == "/status":
         lines = ["Dragonfly admin settings:"]
@@ -1283,6 +1283,20 @@ def process_admin_updates(cfg: Config, con: sqlite3.Connection, updates: list[di
     for update in updates:
         if process_admin_update(cfg, con, update):
             handled += 1
+    return handled
+
+
+def process_pending_admin_updates(cfg: Config, con: sqlite3.Connection) -> int:
+    if not cfg.telegram_admin_user_id:
+        return 0
+    updates = read_cached_telegram_updates_since(con, offset_key="telegram_admin_updates_offset", limit=500)
+    handled = process_admin_updates(cfg, con, updates)
+    max_update_id: int | None = None
+    for update in updates:
+        if isinstance(update.get("update_id"), int):
+            max_update_id = max(max_update_id or 0, int(update["update_id"]))
+    if max_update_id is not None:
+        kv_set(con, "telegram_admin_updates_offset", str(max_update_id + 1))
     return handled
 
 
@@ -1353,6 +1367,35 @@ def store_telegram_updates(con: sqlite3.Connection, updates: list[dict[str, Any]
         "DELETE FROM telegram_update_cache WHERE update_id NOT IN (SELECT update_id FROM telegram_update_cache ORDER BY update_id DESC LIMIT 1000)"
     )
     con.commit()
+
+
+def read_cached_telegram_updates_since(con: sqlite3.Connection, *, offset_key: str, limit: int = 500) -> list[dict[str, Any]]:
+    raw_offset = kv_get(con, offset_key)
+    if raw_offset is None and offset_key == "telegram_admin_updates_offset":
+        raw_global = kv_get(con, "telegram_updates_offset")
+        try:
+            # On first admin pass, replay only the recent tail so admin commands
+            # fetched before admin handling was active are not lost forever.
+            raw_offset = str(max(0, int(raw_global or 0) - 100))
+        except Exception:
+            raw_offset = "0"
+    try:
+        offset = int(raw_offset) if raw_offset is not None else 0
+    except Exception:
+        offset = 0
+    rows = con.execute(
+        "SELECT update_id, payload_json FROM telegram_update_cache WHERE update_id >= ? ORDER BY update_id ASC LIMIT ?",
+        (offset, int(limit)),
+    ).fetchall()
+    updates = []
+    for _update_id, payload in rows:
+        try:
+            data = json.loads(payload)
+            if isinstance(data, dict):
+                updates.append(data)
+        except Exception:
+            continue
+    return updates
 
 
 def read_cached_telegram_updates(con: sqlite3.Connection, *, limit: int = 200) -> list[dict[str, Any]]:
@@ -2490,7 +2533,7 @@ def cmd_watch(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) ->
         try:
             apply_runtime_settings(cfg, con)
             updates = tg_get_updates(cfg, con, timeout=0)
-            handled_admin = process_admin_updates(cfg, con, updates)
+            handled_admin = process_pending_admin_updates(cfg, con)
             if handled_admin:
                 log(f"admin commands handled: {handled_admin}")
             posts = fetch_recent_posts(cfg, args.page_size)

@@ -250,6 +250,26 @@ class DragonflyPosterTests(unittest.TestCase):
         methods = [m for m, _ in calls]
         self.assertIn('answerCallbackQuery', methods)
 
+    def test_admin_menu_alias_and_cached_updates_are_processed_once(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.telegram_token = 'tg'
+        c.telegram_admin_user_id = '498975827'
+        cached_menu = {
+            'update_id': 42,
+            'message': {'message_id': 15, 'chat': {'id': 222}, 'from': {'id': 498975827}, 'text': '/menu'},
+        }
+        poster.store_telegram_updates(con, [cached_menu])
+        poster.kv_set(con, 'telegram_updates_offset', '43')
+        with CaptureTelegram() as calls:
+            handled = poster.process_pending_admin_updates(c, con)
+            handled_again = poster.process_pending_admin_updates(c, con)
+        self.assertEqual(handled, 1)
+        self.assertEqual(handled_again, 0)
+        self.assertEqual([m for m, _ in calls], ['sendMessage'])
+        self.assertIn('reply_markup', calls[0][1])
+        self.assertEqual(poster.kv_get(con, 'telegram_admin_updates_offset'), '43')
+
     def test_runtime_settings_apply_to_config_without_restart(self):
         con = poster.init_db(Path(':memory:'))
         c = cfg()
