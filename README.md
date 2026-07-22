@@ -337,7 +337,7 @@ python3 dragonfly_telegram_poster.py \
   sync-comments-watch --count 16 --offset 34 --interval 30 --send-existing --hot-count 20
 ```
 
-Comments watcher использует gating: для постов вне `--hot-count` он не ходит в `/api/get_comments/<post_id>`, если feed `comments_count` не вырос и нет ранее seeded комментариев без Telegram `message_id`. Если новый комментарий всё-таки отправлен, watcher сразу обновляет stats footer этого поста, чтобы `💬` совпадал с discussion.
+Comments watcher использует gating: для постов вне `--hot-count` он не ходит в `/api/get_comments/<post_id>`, если feed `comments_count` не вырос и нет ранее seeded комментариев без Telegram `message_id`. Перед отправкой каждый comment атомарно резервируется в SQLite, поэтому при overlap/shard-сдвигах только один процесс имеет право отправить конкретный `(post_id, comment_id)`. Если новый комментарий всё-таки отправлен, watcher сразу обновляет stats footer этого поста, чтобы `💬` совпадал с discussion.
 
 Если нужно отправить уже существующие комментарии тоже, добавьте `--send-existing`.
 

@@ -58,6 +58,7 @@ DEFAULT_LOG_FILE = Path.home() / ".hermes" / "logs" / "dragonfly_telegram_poster
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 DEFAULT_API_429_BASE_SLEEP = 30.0
 DEFAULT_API_429_MAX_SLEEP = 900.0
+COMMENT_SEND_RESERVED_MESSAGE_ID = -1
 
 
 @dataclass
@@ -2091,6 +2092,74 @@ def is_comment_sent(con: sqlite3.Connection, post_id: int, comment_id: int) -> b
     return get_comment_record(con, post_id, comment_id) is not None
 
 
+def _comment_db_values(post_id: int, comment: dict[str, Any], *, telegram_chat_id: str | None, telegram_message_id: int | None) -> tuple[Any, ...]:
+    cid = int(comment["id"])
+    parent = comment.get("parent_id")
+    user_id = comment.get("user_id")
+    return (
+        int(post_id),
+        cid,
+        int(parent) if parent is not None else None,
+        int(user_id) if user_id is not None else None,
+        str(comment.get("username") or ""),
+        _html_hash(str(comment.get("text") or "")),
+        str(telegram_chat_id) if telegram_chat_id is not None else None,
+        int(telegram_message_id) if telegram_message_id is not None else None,
+        datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def reserve_comment_for_send(con: sqlite3.Connection, *, post_id: int, comment: dict[str, Any]) -> bool:
+    """Atomically claim a Dragonfly comment before sending it to Telegram.
+
+    Returns True only for the process that owns the send. Existing sent rows and
+    in-flight reservations return False. Previously seeded rows with NULL
+    telegram_message_id can be claimed by exactly one process.
+    """
+    cid = int(comment["id"])
+    now = datetime.now(timezone.utc).isoformat()
+    updated = con.execute(
+        """
+        UPDATE dragonfly_comments
+        SET telegram_message_id = ?, sent_at = ?
+        WHERE post_id = ? AND comment_id = ? AND telegram_message_id IS NULL
+        """,
+        (COMMENT_SEND_RESERVED_MESSAGE_ID, now, int(post_id), cid),
+    ).rowcount
+    if updated:
+        con.commit()
+        return True
+    values = _comment_db_values(
+        int(post_id),
+        comment,
+        telegram_chat_id=None,
+        telegram_message_id=COMMENT_SEND_RESERVED_MESSAGE_ID,
+    )
+    inserted = con.execute(
+        """
+        INSERT OR IGNORE INTO dragonfly_comments(
+            post_id, comment_id, parent_id, user_id, username, text_hash,
+            telegram_chat_id, telegram_message_id, sent_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        values,
+    ).rowcount
+    con.commit()
+    return bool(inserted)
+
+
+def release_comment_reservation(con: sqlite3.Connection, *, post_id: int, comment_id: int) -> None:
+    con.execute(
+        """
+        UPDATE dragonfly_comments
+        SET telegram_message_id = NULL
+        WHERE post_id = ? AND comment_id = ? AND telegram_message_id = ?
+        """,
+        (int(post_id), int(comment_id), COMMENT_SEND_RESERVED_MESSAGE_ID),
+    )
+    con.commit()
+
+
 def mark_comment_sent(
     con: sqlite3.Connection,
     *,
@@ -2099,9 +2168,12 @@ def mark_comment_sent(
     telegram_chat_id: str | None,
     telegram_message_id: int | None,
 ) -> None:
-    cid = int(comment["id"])
-    parent = comment.get("parent_id")
-    user_id = comment.get("user_id")
+    values = _comment_db_values(
+        int(post_id),
+        comment,
+        telegram_chat_id=telegram_chat_id,
+        telegram_message_id=telegram_message_id,
+    )
     con.execute(
         """
         INSERT OR REPLACE INTO dragonfly_comments(
@@ -2109,16 +2181,7 @@ def mark_comment_sent(
             telegram_chat_id, telegram_message_id, sent_at
         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (
-            int(post_id), cid,
-            int(parent) if parent is not None else None,
-            int(user_id) if user_id is not None else None,
-            str(comment.get("username") or ""),
-            _html_hash(str(comment.get("text") or "")),
-            str(telegram_chat_id) if telegram_chat_id is not None else None,
-            int(telegram_message_id) if telegram_message_id is not None else None,
-            datetime.now(timezone.utc).isoformat(),
-        ),
+        values,
     )
     con.commit()
 
@@ -2170,7 +2233,13 @@ def sync_post_comments(cfg: Config, con: sqlite3.Connection, post: dict[str, Any
         if existing is not None:
             if not send_existing or existing["telegram_message_id"] is not None:
                 continue
-            msg_id = send_comment_to_discussion(cfg, target, format_comment_html(c, pid))
+            if not reserve_comment_for_send(con, post_id=pid, comment=c):
+                continue
+            try:
+                msg_id = send_comment_to_discussion(cfg, target, format_comment_html(c, pid))
+            except Exception:
+                release_comment_reservation(con, post_id=pid, comment_id=cid)
+                raise
             mark_comment_sent(con, post_id=pid, comment=c, telegram_chat_id=str(target["discussion_chat_id"]), telegram_message_id=msg_id)
             sent += 1
             continue
@@ -2182,7 +2251,13 @@ def sync_post_comments(cfg: Config, con: sqlite3.Connection, post: dict[str, Any
             mark_comment_sent(con, post_id=pid, comment=c, telegram_chat_id=None, telegram_message_id=None)
             marked += 1
             continue
-        msg_id = send_comment_to_discussion(cfg, target, format_comment_html(c, pid))
+        if not reserve_comment_for_send(con, post_id=pid, comment=c):
+            continue
+        try:
+            msg_id = send_comment_to_discussion(cfg, target, format_comment_html(c, pid))
+        except Exception:
+            release_comment_reservation(con, post_id=pid, comment_id=cid)
+            raise
         mark_comment_sent(con, post_id=pid, comment=c, telegram_chat_id=str(target["discussion_chat_id"]), telegram_message_id=msg_id)
         sent += 1
     if marked:

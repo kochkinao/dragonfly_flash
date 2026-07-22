@@ -835,6 +835,18 @@ class DragonflyPosterTests(unittest.TestCase):
         row = con.execute('SELECT telegram_message_id FROM dragonfly_comments WHERE post_id=904 AND comment_id=10').fetchone()
         self.assertEqual(row, (901,))
 
+    def test_reserve_comment_for_send_allows_only_one_in_flight_sender(self):
+        con = poster.init_db(Path(':memory:'))
+        comment = {'id': 30, 'username': 'Alice', 'text': 'race', 'created_at': '2026-07-21T10:00:00', 'likes_count': 0}
+
+        first = poster.reserve_comment_for_send(con, post_id=908, comment=comment)
+        second = poster.reserve_comment_for_send(con, post_id=908, comment=comment)
+
+        self.assertTrue(first)
+        self.assertFalse(second)
+        rows = con.execute('SELECT comment_id, telegram_message_id FROM dragonfly_comments WHERE post_id=908').fetchall()
+        self.assertEqual(rows, [(30, poster.COMMENT_SEND_RESERVED_MESSAGE_ID)])
+
     def test_sync_comments_skips_old_post_when_feed_comment_count_unchanged(self):
         con = poster.init_db(Path(':memory:'))
         c = cfg()
