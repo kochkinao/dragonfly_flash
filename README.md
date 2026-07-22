@@ -226,6 +226,33 @@ python3 dragonfly_telegram_poster.py \
 
 `--offset` позволяет шардировать окна между несколькими read-only watcher'ами без пересечения.
 
+## Канал «Лучшее»
+
+Посты, которые набрали лайки выше порога, можно пересылать в отдельный канал:
+
+```env
+TELEGRAM_BEST_CHAT_ID=-100xxxxxxxxxx
+```
+
+Один проход:
+
+```bash
+python3 dragonfly_telegram_poster.py \
+  --env-file /home/wacotal/dragonfly.env \
+  sync-best --count 50 --threshold 7
+```
+
+Постоянный watcher:
+
+```bash
+python3 dragonfly_telegram_poster.py \
+  --env-file /home/wacotal/dragonfly.env \
+  --dragonfly-account backup_1 \
+  sync-best-watch --count 50 --interval 30 --threshold 7
+```
+
+Скрипт использует SQLite-таблицу `best_posts` для dedupe: один Dragonfly `post_id` не пересылается повторно, даже если лайки потом колебались. Для split-постов пересылаются сохранённые `main` и `last` Telegram-сообщения; для обычных постов это одно сообщение.
+
 ## Telegram discussion group
 
 Если канал привязан к группе обсуждений, укажите её ID:

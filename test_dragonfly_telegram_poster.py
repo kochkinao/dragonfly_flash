@@ -39,6 +39,7 @@ def cfg():
         upload_media=False,
         alert_chat_id=None,
         discussion_chat_id=None,
+        best_chat_id=None,
         cookie_file=None,
     )
 
@@ -889,6 +890,41 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertIn('💬 3', calls[0][1]['text'])
         row = con.execute("SELECT last_comments FROM telegram_messages WHERE post_id=891").fetchone()
         self.assertEqual(row, (3,))
+
+    def test_sync_best_post_forwards_once_and_records_dedupe(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        c.best_chat_id = '-100best'
+        c.send_delay = 0
+        poster.record_telegram_message(con, post(post_id=777, likes_count=7), chat_id='@channel', message_id=100, message_kind='text', base_html='main', role='main')
+        poster.record_telegram_message(con, post(post_id=777, likes_count=7), chat_id='@channel', message_id=101, message_kind='text', base_html='last', role='last')
+        calls = []
+        seq = {'message_id': 200}
+        orig = poster.tg_request
+        poster.tg_request = lambda cfg, method, payload: calls.append((method, payload)) or {'ok': True, 'result': {'message_id': seq.__setitem__('message_id', seq['message_id'] + 1) or seq['message_id']}}
+        try:
+            self.assertTrue(poster.sync_best_post(c, con, post(post_id=777, likes_count=7), threshold=7))
+            self.assertFalse(poster.sync_best_post(c, con, post(post_id=777, likes_count=9), threshold=7))
+        finally:
+            poster.tg_request = orig
+
+        self.assertEqual([m for m, _p in calls], ['forwardMessage', 'forwardMessage'])
+        self.assertEqual(calls[0][1]['chat_id'], '-100best')
+        self.assertEqual(calls[0][1]['message_id'], 100)
+        self.assertEqual(calls[1][1]['message_id'], 101)
+        row = con.execute('SELECT likes_at_send, source_message_ids FROM best_posts WHERE post_id=777').fetchone()
+        self.assertEqual(row[0], 7)
+        self.assertEqual(json.loads(row[1]), [100, 101])
+
+    def test_sync_best_post_ignores_posts_below_threshold(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.best_chat_id = '-100best'
+        poster.record_telegram_message(con, post(post_id=778, likes_count=6), chat_id='@channel', message_id=100, message_kind='text', base_html='main', role='main')
+        with CaptureTelegram() as calls:
+            self.assertFalse(poster.sync_best_post(c, con, post(post_id=778, likes_count=6), threshold=7))
+        self.assertEqual(calls, [])
 
     def test_long_split_post_records_last_role_for_final_part(self):
         con = poster.init_db(Path(':memory:'))

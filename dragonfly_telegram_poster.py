@@ -85,7 +85,9 @@ class Config:
     upload_media: bool
     alert_chat_id: str | None
     discussion_chat_id: str | None
+    best_chat_id: str | None
     cookie_file: str | None
+    best_likes_threshold: int = 7
     accounts_file: str | None = None
     account_name: str | None = None
     account_pinned: bool = False
@@ -370,6 +372,19 @@ def init_db(path: Path) -> sqlite3.Connection:
     )
     con.execute(
         """
+        CREATE TABLE IF NOT EXISTS best_posts (
+            post_id INTEGER PRIMARY KEY,
+            source_chat_id TEXT NOT NULL,
+            source_message_ids TEXT NOT NULL,
+            best_chat_id TEXT NOT NULL,
+            best_message_ids TEXT NOT NULL,
+            likes_at_send INTEGER NOT NULL,
+            sent_at TEXT NOT NULL
+        )
+        """
+    )
+    con.execute(
+        """
         CREATE TABLE IF NOT EXISTS dragonfly_comments (
             post_id INTEGER NOT NULL,
             comment_id INTEGER NOT NULL,
@@ -600,6 +615,53 @@ def mark_telegram_message_uneditable(con: sqlite3.Connection, post_id: int, erro
     con.execute(
         "UPDATE telegram_messages SET can_edit = 0, last_error = ? WHERE post_id = ? AND role = 'main'",
         (error[:1000], int(post_id)),
+    )
+    con.commit()
+
+
+def get_telegram_message(con: sqlite3.Connection, post_id: int, role: str) -> sqlite3.Row | None:
+    old_factory = con.row_factory
+    con.row_factory = sqlite3.Row
+    try:
+        row = con.execute(
+            "SELECT * FROM telegram_messages WHERE post_id = ? AND role = ?",
+            (int(post_id), str(role)),
+        ).fetchone()
+    finally:
+        con.row_factory = old_factory
+    return row
+
+
+def is_best_post_sent(con: sqlite3.Connection, post_id: int) -> bool:
+    return con.execute("SELECT 1 FROM best_posts WHERE post_id = ?", (int(post_id),)).fetchone() is not None
+
+
+def record_best_post(
+    con: sqlite3.Connection,
+    *,
+    post_id: int,
+    source_chat_id: str,
+    source_message_ids: list[int],
+    best_chat_id: str,
+    best_message_ids: list[int],
+    likes_at_send: int,
+) -> None:
+    con.execute(
+        """
+        INSERT OR IGNORE INTO best_posts(
+            post_id, source_chat_id, source_message_ids, best_chat_id,
+            best_message_ids, likes_at_send, sent_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(post_id),
+            str(source_chat_id),
+            json.dumps([int(x) for x in source_message_ids], ensure_ascii=False),
+            str(best_chat_id),
+            json.dumps([int(x) for x in best_message_ids], ensure_ascii=False),
+            int(likes_at_send),
+            datetime.now(timezone.utc).isoformat(),
+        ),
     )
     con.commit()
 
@@ -1837,6 +1899,101 @@ def sync_post_stats(cfg: Config, con: sqlite3.Connection, post: dict[str, Any]) 
     return True
 
 
+def source_message_ids_for_best(con: sqlite3.Connection, post_id: int) -> tuple[str, list[int]] | None:
+    main = get_telegram_message(con, post_id, "main")
+    if main is None:
+        return None
+    ids = [int(main["message_id"])]
+    last = get_telegram_message(con, post_id, "last")
+    if last is not None and int(last["message_id"]) not in ids:
+        ids.append(int(last["message_id"]))
+    return str(main["chat_id"]), ids
+
+
+def forward_to_best(cfg: Config, *, source_chat_id: str, source_message_ids: list[int]) -> list[int]:
+    if not cfg.best_chat_id:
+        raise RuntimeError("TELEGRAM_BEST_CHAT_ID / --best-chat-id is required for best-post forwarding")
+    forwarded_ids: list[int] = []
+    for mid in source_message_ids:
+        resp = tg_request(
+            cfg,
+            "forwardMessage",
+            {"chat_id": cfg.best_chat_id, "from_chat_id": source_chat_id, "message_id": int(mid)},
+        )
+        new_mid = _message_id_from_tg_response(resp)
+        if new_mid is not None:
+            forwarded_ids.append(int(new_mid))
+        time.sleep(max(0.0, cfg.send_delay))
+    return forwarded_ids
+
+
+def sync_best_post(cfg: Config, con: sqlite3.Connection, post: dict[str, Any], *, threshold: int | None = None) -> bool:
+    pid = int(post["post_id"])
+    likes, _comments = extract_post_stats(post)
+    threshold = cfg.best_likes_threshold if threshold is None else int(threshold)
+    if likes is None or int(likes) < threshold:
+        return False
+    if is_best_post_sent(con, pid):
+        return False
+    source = source_message_ids_for_best(con, pid)
+    if source is None:
+        log(f"best skip post #{pid}: no Telegram message mapping", logging.DEBUG)
+        return False
+    source_chat_id, source_message_ids = source
+    best_ids = forward_to_best(cfg, source_chat_id=source_chat_id, source_message_ids=source_message_ids)
+    record_best_post(
+        con,
+        post_id=pid,
+        source_chat_id=source_chat_id,
+        source_message_ids=source_message_ids,
+        best_chat_id=str(cfg.best_chat_id),
+        best_message_ids=best_ids,
+        likes_at_send=int(likes),
+    )
+    log(f"best forwarded post #{pid}: likes={likes} messages={len(source_message_ids)}")
+    return True
+
+
+def cmd_sync_best(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
+    if not cfg.best_chat_id:
+        raise SystemExit("Set TELEGRAM_BEST_CHAT_ID or --best-chat-id")
+    cfg.best_likes_threshold = int(args.threshold)
+    old_limit = cfg.limit
+    try:
+        cfg.limit = max(cfg.limit, int(args.count))
+        posts = fetch_recent_posts(cfg, int(args.count), start_offset=int(getattr(args, "offset", 0)))
+    finally:
+        cfg.limit = old_limit
+    sent = 0
+    seen = 0
+    for p in posts[: int(args.count)]:
+        seen += 1
+        try:
+            if sync_best_post(cfg, con, p, threshold=int(args.threshold)):
+                sent += 1
+        except Exception as e:
+            log_exception(f"best sync failed post #{p.get('post_id')}", e)
+            send_alert(cfg, "Ошибка пересылки в Лучшее", f"Пост #{p.get('post_id')}: {str(e)[:500]}", level="warning")
+    log(f"sync-best done checked={seen} sent={sent} threshold={int(args.threshold)}")
+    return 0
+
+
+def cmd_sync_best_watch(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
+    log(f"sync-best-watch started interval={args.interval}s count={args.count} offset={getattr(args, 'offset', 0)} threshold={args.threshold} account={cfg.account_name or 'default'} dry_run={cfg.dry_run}")
+    while True:
+        try:
+            cmd_sync_best(cfg, con, args)
+        except Exception as e:
+            log_exception("sync-best-watch loop error", e)
+            send_alert(
+                cfg,
+                "Ошибка sync-best-watch",
+                f"Мониторинг Лучшего не остановлен: подожду {human_duration(args.interval)} и попробую снова. Причина: {str(e)[:500]}",
+                level="error",
+            )
+        time.sleep(float(args.interval))
+
+
 def fetch_post_comments(cfg: Config, post_id: int) -> list[dict[str, Any]]:
     uid = dragonfly_user_id(cfg)
     if not uid:
@@ -2070,6 +2227,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--url-media", action="store_true", help="send media as URLs instead of uploading downloaded bytes (not recommended for Dragonfly)")
     p.add_argument("--alert-chat-id", default=None, help="send user-friendly warnings/errors to this Telegram user/chat; env TELEGRAM_ALERT_CHAT_ID also works")
     p.add_argument("--discussion-chat-id", default=None, help="linked Telegram discussion group id; env TELEGRAM_DISCUSSION_CHAT_ID also works")
+    p.add_argument("--best-chat-id", default=None, help="Telegram channel id for best posts; env TELEGRAM_BEST_CHAT_ID also works")
     p.add_argument("--dragonfly-user-id", default=None, help="Dragonfly user id for /api/get_comments; env DRAGONFLY_USER_ID also works")
     p.add_argument("--cookie-file", default=None, help="Dragonfly Mozilla/Netscape cookie jar; env DRAGONFLY_COOKIE_FILE also works. Preferred over legacy JWT.")
     p.add_argument("--accounts-file", default=None, help="JSON file with Dragonfly account tokens for 401/auth failover; env DRAGONFLY_ACCOUNTS_FILE also works.")
@@ -2111,6 +2269,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--interval", type=float, default=30.0, help="seconds between comment sync ticks")
     s.add_argument("--offset", type=int, default=0, help="Dragonfly feed offset; useful for sharding read-only watchers")
     s.add_argument("--send-existing", action="store_true", help="send already existing comments too; default seeds existing comments silently on first observation")
+
+    s = sub.add_parser("sync-best", help="one-shot forward posts that reached the likes threshold to the best channel")
+    s.add_argument("--count", type=int, default=50, help="recent Dragonfly posts to inspect")
+    s.add_argument("--offset", type=int, default=0, help="Dragonfly feed offset")
+    s.add_argument("--threshold", type=int, default=7, help="minimum likes required for best channel")
+
+    s = sub.add_parser("sync-best-watch", help="poll likes and forward newly qualifying posts to the best channel forever")
+    s.add_argument("--count", type=int, default=50, help="recent Dragonfly posts to inspect per tick")
+    s.add_argument("--interval", type=float, default=30.0, help="seconds between best sync ticks")
+    s.add_argument("--offset", type=int, default=0, help="Dragonfly feed offset")
+    s.add_argument("--threshold", type=int, default=7, help="minimum likes required for best channel")
     return p
 
 
@@ -2143,6 +2312,7 @@ def main() -> int:
         upload_media=not bool(args.url_media),
         alert_chat_id=args.alert_chat_id or optional_env("TELEGRAM_ALERT_CHAT_ID"),
         discussion_chat_id=args.discussion_chat_id or optional_env("TELEGRAM_DISCUSSION_CHAT_ID"),
+        best_chat_id=args.best_chat_id or optional_env("TELEGRAM_BEST_CHAT_ID"),
         cookie_file=args.cookie_file or optional_env("DRAGONFLY_COOKIE_FILE"),
         accounts_file=args.accounts_file or optional_env("DRAGONFLY_ACCOUNTS_FILE"),
         account_name=args.dragonfly_account or None,
@@ -2169,6 +2339,10 @@ def main() -> int:
         return cmd_sync_comments(cfg, con, args)
     if args.cmd == "sync-comments-watch":
         return cmd_sync_comments_watch(cfg, con, args)
+    if args.cmd == "sync-best":
+        return cmd_sync_best(cfg, con, args)
+    if args.cmd == "sync-best-watch":
+        return cmd_sync_best_watch(cfg, con, args)
     raise AssertionError(args.cmd)
 
 
