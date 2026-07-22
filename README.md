@@ -388,6 +388,123 @@ python3 dragonfly_telegram_poster.py --env-file ~/dragonfly.env doctor
 
 Не переносите в Git реальные `.env`, cookie jar, SQLite state, логи, токены, SSH keys или `Domain name.txt`.
 
+## Production PM2 / prod-branch автодеплой
+
+Для нового production-сервера предпочтительная схема — PM2 + `prod` branch:
+
+```text
+local dev -> tests -> git push origin main/prod
+server -> watches origin/prod -> git reset --hard origin/prod -> doctor --no-network -> pm2 reload
+```
+
+PM2 process file:
+
+```text
+ecosystem.config.cjs
+```
+
+Он запускает 7 процессов:
+
+```text
+dragonfly-watch
+dragonfly-feed-cache
+dragonfly-stats-hot       --use-feed-cache
+dragonfly-stats-cold      --use-feed-cache
+dragonfly-comments-0      --use-feed-cache
+dragonfly-comments-17     --use-feed-cache
+dragonfly-comments-34     --use-feed-cache
+```
+
+### Первичная настройка PM2 на сервере
+
+```bash
+# Node/PM2
+npm install -g pm2
+
+# repo
+mkdir -p ~/apps
+cd ~/apps
+git clone git@github.com:kochkinao/dragonfly_flash.git
+cd dragonfly_flash
+git checkout prod
+
+# secrets/state: НЕ из Git
+cp dragonfly.env.example ~/dragonfly.env
+chmod 600 ~/dragonfly.env
+# заполнить ~/dragonfly.env реальными значениями
+
+# если переносим существующий runtime state:
+python3 dragonfly_telegram_poster.py \
+  import-state ~/dragonfly-state-YYYYMMDD-HHMMSS.tar.gz \
+  --db ~/.hermes/state/dragonfly_telegram_poster.sqlite3 \
+  --accounts-file ~/.dragonfly_accounts.json
+
+python3 dragonfly_telegram_poster.py --env-file ~/dragonfly.env doctor --no-network
+python3 dragonfly_telegram_poster.py --env-file ~/dragonfly.env doctor
+
+DRAGONFLY_ENV_FILE=~/dragonfly.env pm2 startOrReload ecosystem.config.cjs --update-env
+pm2 save
+pm2 startup
+```
+
+`pm2 startup` напечатает команду с `sudo`; её нужно выполнить один раз, чтобы PM2 воскресал после reboot.
+
+Проверка:
+
+```bash
+pm2 status
+scripts/pm2_status.sh
+```
+
+### Ручной deploy с prod branch
+
+```bash
+cd ~/apps/dragonfly_flash
+DRAGONFLY_ENV_FILE=~/dragonfly.env scripts/deploy_prod.sh
+```
+
+`deploy_prod.sh` делает:
+
+```text
+git fetch origin prod
+git reset --hard origin/prod
+python3 -m py_compile ...
+python3 dragonfly_telegram_poster.py --env-file "$DRAGONFLY_ENV_FILE" doctor --no-network
+pm2 startOrReload ecosystem.config.cjs --update-env
+pm2 save
+```
+
+### Автодеплой через poller
+
+Самый простой безопасный вариант — poller на сервере без публичного webhook endpoint:
+
+```bash
+cd ~/apps/dragonfly_flash
+PM2_DEPLOY_INTERVAL=60 DRAGONFLY_ENV_FILE=~/dragonfly.env \
+  pm2 start scripts/prod_branch_poller.sh --name dragonfly-prod-poller --interpreter bash
+pm2 save
+```
+
+Теперь сервер будет проверять `origin/prod` раз в минуту и перезапускать bridge только если SHA изменился.
+
+Переменные:
+
+```text
+DRAGONFLY_ENV_FILE      default: ~/dragonfly.env
+PM2_DEPLOY_REMOTE       default: origin
+PM2_DEPLOY_BRANCH       default: prod
+PM2_DEPLOY_INTERVAL     default: 60
+PYTHON                  default: python3
+```
+
+Остановить автодеплой:
+
+```bash
+pm2 stop dragonfly-prod-poller
+pm2 delete dragonfly-prod-poller
+pm2 save
+```
+
 ## Загрузка треков в Dragonfly
 
 Для массовой загрузки аудио есть отдельный скрипт:
