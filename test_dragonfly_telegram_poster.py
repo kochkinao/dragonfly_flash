@@ -296,6 +296,36 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertEqual(poster.kv_get(con, 'telegram_admin_updates_offset'), '52')
         self.assertTrue(any(method == 'sendMessage' and 'reply_markup' in payload for method, payload in calls))
 
+    def test_admin_watch_polls_telegram_and_processes_cached_admin_updates(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.telegram_token = 'tg'
+        c.telegram_admin_user_id = '498975827'
+        c.dry_run = False
+        args = type('Args', (), {'interval': 0, 'once': True, 'timeout': 0})()
+        calls = []
+        orig_tg = poster.tg_request
+        orig_sleep = poster.time.sleep
+        def fake_tg_request(_cfg, method, payload):
+            calls.append((method, payload))
+            if method == 'getUpdates':
+                return {'ok': True, 'result': [{
+                    'update_id': 60,
+                    'message': {'message_id': 3, 'chat': {'id': 222}, 'from': {'id': 498975827}, 'text': '/panel'},
+                }]}
+            return {'ok': True, 'result': {'message_id': 4}}
+        poster.tg_request = fake_tg_request
+        poster.time.sleep = lambda *_: None
+        try:
+            rc = poster.cmd_admin_watch(c, con, args)
+        finally:
+            poster.tg_request = orig_tg
+            poster.time.sleep = orig_sleep
+        self.assertEqual(rc, 0)
+        self.assertIn('getUpdates', [m for m, _ in calls])
+        self.assertTrue(any(method == 'sendMessage' and 'reply_markup' in payload for method, payload in calls))
+        self.assertEqual(poster.kv_get(con, 'telegram_admin_updates_offset'), '61')
+
     def test_runtime_settings_apply_to_config_without_restart(self):
         con = poster.init_db(Path(':memory:'))
         c = cfg()
@@ -1194,17 +1224,12 @@ class DragonflyPosterTests(unittest.TestCase):
                 'forward_from_message_id': 555,
             },
         }]
-        orig = poster.tg_request
-        poster.tg_request = lambda cfg, method, payload: {'ok': True, 'result': updates}
-        try:
-            did = poster.try_capture_discussion_mapping(c, con, post_id=901, role='last', channel_message_id=555, wait_seconds=0)
-        finally:
-            poster.tg_request = orig
+        poster.store_telegram_updates(con, updates)
+        did = poster.try_capture_discussion_mapping(c, con, post_id=901, role='last', channel_message_id=555, wait_seconds=0)
 
         self.assertEqual(did, 777)
         row = con.execute("SELECT discussion_chat_id, discussion_message_id FROM telegram_discussion_messages WHERE post_id=901 AND role='last'").fetchone()
         self.assertEqual(row, ('-100222', 777))
-        self.assertEqual(poster.kv_get(con, 'telegram_updates_offset'), '11')
 
     def test_repair_discussion_mapping_recovers_missing_last_mapping(self):
         con = poster.init_db(Path(':memory:'))

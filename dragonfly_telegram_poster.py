@@ -1482,9 +1482,9 @@ def try_capture_discussion_mapping(
     deadline = time.monotonic() + wait_seconds
     while True:
         try:
-            updates = read_cached_telegram_updates(con) + tg_get_updates(cfg, con, timeout=int(update_timeout))
+            updates = read_cached_telegram_updates(con)
         except Exception as e:
-            log(f"discussion mapping getUpdates failed post #{post_id}: {e}", logging.WARNING)
+            log(f"discussion mapping cache read failed post #{post_id}: {e}", logging.WARNING)
             return None
         for upd in updates:
             msg = upd.get("message") or upd.get("channel_post") or {}
@@ -2534,15 +2534,35 @@ def cmd_backfill(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace)
     return 0
 
 
+def cmd_admin_watch(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
+    interval = float(getattr(args, "interval", 1.0))
+    timeout = int(getattr(args, "timeout", 20))
+    once = bool(getattr(args, "once", False))
+    log(f"admin-watch started interval={interval}s timeout={timeout}s dry_run={cfg.dry_run}")
+    while True:
+        try:
+            tg_get_updates(cfg, con, timeout=timeout)
+            handled = process_pending_admin_updates(cfg, con)
+            if handled:
+                log(f"admin commands handled: {handled}")
+        except Exception as e:
+            log_exception("admin-watch loop error", e)
+            send_alert(
+                cfg,
+                "Ошибка admin-bot",
+                f"Панель управления не остановлена: подожду {human_duration(interval)} и попробую снова. Причина: {str(e)[:500]}",
+                level="error",
+            )
+        if once:
+            return 0
+        time.sleep(interval)
+
+
 def cmd_watch(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
     log(f"watch started poll_interval={cfg.poll_interval}s send_delay={cfg.send_delay}s dry_run={cfg.dry_run}")
     while True:
         try:
             apply_runtime_settings(cfg, con)
-            updates = tg_get_updates(cfg, con, timeout=0)
-            handled_admin = process_pending_admin_updates(cfg, con)
-            if handled_admin:
-                log(f"admin commands handled: {handled_admin}")
             posts = fetch_recent_posts(cfg, args.page_size)
             n = send_new_posts(cfg, con, posts)
             catchup = 0
@@ -3366,6 +3386,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-catch-up-gaps", dest="catch_up_gaps", action="store_false", default=True, help="disable exact /api/post/<id> gap catch-up")
     s.add_argument("--max-gap-scan", type=int, default=200, help="largest ID span to scan for missing posts per poll")
 
+    s = sub.add_parser("admin-watch", help="poll Telegram admin bot updates forever")
+    s.add_argument("--interval", type=float, default=1.0, help="seconds between admin polling ticks")
+    s.add_argument("--timeout", type=int, default=20, help="Bot API getUpdates long-poll timeout")
+    s.add_argument("--once", action="store_true", help="poll/process once and exit")
+
     s = sub.add_parser("sync-stats", help="one-shot sync of likes/comments for recent posts already mapped to Telegram")
     s.add_argument("--count", type=int, default=20, help="recent Dragonfly posts to inspect")
     s.add_argument("--offset", type=int, default=0, help="Dragonfly feed offset; useful for sharding read-only watchers")
@@ -3469,6 +3494,8 @@ def main() -> int:
         return cmd_backfill(cfg, con, args)
     if args.cmd == "watch":
         return cmd_watch(cfg, con, args)
+    if args.cmd == "admin-watch":
+        return cmd_admin_watch(cfg, con, args)
     if args.cmd == "sync-stats":
         return cmd_sync_stats(cfg, con, args)
     if args.cmd == "sync-stats-watch":

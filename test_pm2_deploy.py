@@ -17,6 +17,7 @@ class PM2DeployTests(unittest.TestCase):
 
         text = ecosystem.read_text(encoding='utf-8')
         for name in (
+            'dragonfly-admin-bot',
             'dragonfly-watch',
             'dragonfly-feed-cache',
             'dragonfly-stats-hot',

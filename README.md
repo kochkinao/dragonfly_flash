@@ -97,7 +97,7 @@ DRAGONFLY_ACCOUNTS_FILE=/secure/path/dragonfly_accounts.json
 
 ### Telegram admin commands
 
-Если задан `TELEGRAM_ADMIN_USER_ID`, основной процесс `watch` принимает admin-команды в личке с тем же ботом, который публикует посты и комментарии. Доступ разрешён только Telegram `from.id`, равному `TELEGRAM_ADMIN_USER_ID`; остальные получают короткое `Нет доступа`. Секреты/env/token values команды не показывают.
+Если задан `TELEGRAM_ADMIN_USER_ID`, отдельный процесс `dragonfly-admin-bot` принимает admin-команды в личке с тем же ботом, который публикует посты и комментарии. Доступ разрешён только Telegram `from.id`, равному `TELEGRAM_ADMIN_USER_ID`; остальные получают короткое `Нет доступа`. Секреты/env/token values команды не показывают.
 
 Команды:
 
@@ -140,7 +140,7 @@ comments_interval
 
 Ручные `/set` и `/get` оставлены как fallback, если кнопки недоступны.
 
-Настройки сохраняются в SQLite (`kv` keys `runtime_setting.*`) и применяются watcher'ами на следующем цикле без ручного рестарта. Используется общий Telegram `getUpdates` offset/cache, поэтому не запускайте второй независимый long-poller с тем же bot token.
+Настройки сохраняются в SQLite (`kv` keys `runtime_setting.*`) и применяются watcher'ами на следующем цикле без ручного рестарта. Telegram `getUpdates` long-polling выполняет только `dragonfly-admin-bot`; остальные процессы используют общий SQLite update cache, поэтому не запускайте второй независимый long-poller с тем же bot token.
 
 ## Рекомендуемые безопасные параметры
 
@@ -451,9 +451,10 @@ PM2 process file:
 ecosystem.config.cjs
 ```
 
-Он запускает 7 процессов:
+Он запускает 8 процессов:
 
 ```text
+dragonfly-admin-bot       Telegram commands + update cache
 dragonfly-watch
 dragonfly-feed-cache
 dragonfly-stats-hot       --use-feed-cache

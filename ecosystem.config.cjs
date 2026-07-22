@@ -43,6 +43,12 @@ const common = [
 
 module.exports = {
   apps: [
+    app('dragonfly-admin-bot', [
+      ...common,
+      'admin-watch',
+      '--interval', '1',
+      '--timeout', '20',
+    ]),
     app('dragonfly-watch', [
       ...common,
       '--request-delay', '2',
