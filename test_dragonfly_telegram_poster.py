@@ -326,6 +326,32 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertTrue(any(method == 'sendMessage' and 'reply_markup' in payload for method, payload in calls))
         self.assertEqual(poster.kv_get(con, 'telegram_admin_updates_offset'), '61')
 
+    def test_admin_watch_timeout_does_not_send_dm_alert(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.telegram_token = 'tg'
+        c.telegram_admin_user_id = '498975827'
+        c.alert_chat_id = '498975827'
+        c.dry_run = False
+        args = type('Args', (), {'interval': 0, 'once': True, 'timeout': 0})()
+        calls = []
+        orig_tg = poster.tg_request
+        orig_sleep = poster.time.sleep
+        def fake_tg_request(_cfg, method, payload):
+            calls.append((method, payload))
+            if method == 'getUpdates':
+                raise TimeoutError('The read operation timed out')
+            return {'ok': True, 'result': {'message_id': 4}}
+        poster.tg_request = fake_tg_request
+        poster.time.sleep = lambda *_: None
+        try:
+            rc = poster.cmd_admin_watch(c, con, args)
+        finally:
+            poster.tg_request = orig_tg
+            poster.time.sleep = orig_sleep
+        self.assertEqual(rc, 0)
+        self.assertEqual([method for method, _payload in calls], ['getUpdates'])
+
     def test_runtime_settings_apply_to_config_without_restart(self):
         con = poster.init_db(Path(':memory:'))
         c = cfg()

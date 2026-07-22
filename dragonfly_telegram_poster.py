@@ -2534,6 +2534,21 @@ def cmd_backfill(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace)
     return 0
 
 
+def is_transient_timeout_error(e: BaseException) -> bool:
+    if isinstance(e, TimeoutError):
+        return True
+    text = str(e).lower()
+    if "timed out" in text or "timeout" in text:
+        return True
+    if isinstance(e, urllib.error.URLError):
+        reason = getattr(e, "reason", None)
+        if isinstance(reason, TimeoutError):
+            return True
+        reason_text = str(reason).lower()
+        return "timed out" in reason_text or "timeout" in reason_text
+    return False
+
+
 def cmd_admin_watch(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
     interval = float(getattr(args, "interval", 1.0))
     timeout = int(getattr(args, "timeout", 20))
@@ -2546,13 +2561,16 @@ def cmd_admin_watch(cfg: Config, con: sqlite3.Connection, args: argparse.Namespa
             if handled:
                 log(f"admin commands handled: {handled}")
         except Exception as e:
-            log_exception("admin-watch loop error", e)
-            send_alert(
-                cfg,
-                "Ошибка admin-bot",
-                f"Панель управления не остановлена: подожду {human_duration(interval)} и попробую снова. Причина: {str(e)[:500]}",
-                level="error",
-            )
+            if is_transient_timeout_error(e):
+                log(f"admin-watch transient timeout: {e}", logging.WARNING)
+            else:
+                log_exception("admin-watch loop error", e)
+                send_alert(
+                    cfg,
+                    "Ошибка admin-bot",
+                    f"Панель управления не остановлена: подожду {human_duration(interval)} и попробую снова. Причина: {str(e)[:500]}",
+                    level="error",
+                )
         if once:
             return 0
         time.sleep(interval)
