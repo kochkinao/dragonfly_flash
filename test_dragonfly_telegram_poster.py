@@ -173,7 +173,7 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertIn('нет доступа', calls[0][1]['text'].lower())
         self.assertIn('request_delay = 3.0', calls[1][1]['text'])
 
-    def test_admin_panel_sends_inline_keyboard_and_callback_changes_setting(self):
+    def test_admin_panel_opens_parameter_details_with_explanation_and_fixed_values(self):
         con = poster.init_db(Path(':memory:'))
         c = cfg()
         c.telegram_token = 'tg'
@@ -182,25 +182,73 @@ class DragonflyPosterTests(unittest.TestCase):
             'update_id': 3,
             'message': {'message_id': 12, 'chat': {'id': 222}, 'from': {'id': 498975827}, 'text': '/panel'},
         }
-        callback = {
+        detail = {
             'update_id': 4,
             'callback_query': {
                 'id': 'cb1',
                 'from': {'id': 498975827},
                 'message': {'message_id': 12, 'chat': {'id': 222}},
-                'data': 'admin:inc:request_delay',
+                'data': 'admin:setting:request_delay',
+            },
+        }
+        fixed = {
+            'update_id': 5,
+            'callback_query': {
+                'id': 'cb2',
+                'from': {'id': 498975827},
+                'message': {'message_id': 12, 'chat': {'id': 222}},
+                'data': 'admin:set:request_delay:4',
             },
         }
         with CaptureTelegram() as calls:
             self.assertTrue(poster.process_admin_update(c, con, panel))
-            self.assertTrue(poster.process_admin_update(c, con, callback))
+            self.assertTrue(poster.process_admin_update(c, con, detail))
+            self.assertTrue(poster.process_admin_update(c, con, fixed))
         self.assertEqual(calls[0][0], 'sendMessage')
-        self.assertIn('reply_markup', calls[0][1])
-        self.assertIn('inline_keyboard', calls[0][1]['reply_markup'])
-        self.assertEqual(poster.kv_get(con, 'runtime_setting.request_delay'), '3.0')
+        keyboard_text = json.dumps(calls[0][1]['reply_markup'], ensure_ascii=False)
+        self.assertIn('🌐 API-задержка', keyboard_text)
+        self.assertIn('↩️ Сбросить всё к default', keyboard_text)
+        edited_texts = [payload['text'] for method, payload in calls if method == 'editMessageText']
+        self.assertTrue(any('Что регулирует' in text and 'Текущее значение' in text for text in edited_texts))
+        self.assertEqual(poster.kv_get(con, 'runtime_setting.request_delay'), '4.0')
+
+    def test_admin_panel_custom_value_flow_and_reset_defaults(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.telegram_token = 'tg'
+        c.telegram_admin_user_id = '498975827'
+        custom = {
+            'update_id': 6,
+            'callback_query': {
+                'id': 'cb3',
+                'from': {'id': 498975827},
+                'message': {'message_id': 12, 'chat': {'id': 222}},
+                'data': 'admin:custom:comments_interval',
+            },
+        }
+        typed = {
+            'update_id': 7,
+            'message': {'message_id': 13, 'chat': {'id': 222}, 'from': {'id': 498975827}, 'text': '45'},
+        }
+        reset = {
+            'update_id': 8,
+            'callback_query': {
+                'id': 'cb4',
+                'from': {'id': 498975827},
+                'message': {'message_id': 12, 'chat': {'id': 222}},
+                'data': 'admin:reset_defaults',
+            },
+        }
+        with CaptureTelegram() as calls:
+            self.assertTrue(poster.process_admin_update(c, con, custom))
+            self.assertEqual(poster.kv_get(con, 'admin_pending_setting.498975827'), 'comments_interval')
+            self.assertTrue(poster.process_admin_update(c, con, typed))
+            self.assertEqual(poster.kv_get(con, 'runtime_setting.comments_interval'), '45.0')
+            self.assertIsNone(poster.kv_get(con, 'admin_pending_setting.498975827'))
+            self.assertTrue(poster.process_admin_update(c, con, reset))
+        self.assertIsNone(poster.kv_get(con, 'runtime_setting.comments_interval'))
         methods = [m for m, _ in calls]
         self.assertIn('answerCallbackQuery', methods)
-        self.assertIn('editMessageText', methods)
 
     def test_runtime_settings_apply_to_config_without_restart(self):
         con = poster.init_db(Path(':memory:'))
