@@ -3,6 +3,7 @@ dragonfly.env
 .env
 *.env
 !dragonfly.env.example
+Domain name.txt
 
 # Runtime state
 *.sqlite3

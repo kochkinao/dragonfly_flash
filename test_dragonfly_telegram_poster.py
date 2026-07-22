@@ -2,6 +2,7 @@ import importlib.util
 import io
 import json
 import sys
+import tarfile
 import tempfile
 import unittest
 import urllib.error
@@ -76,6 +77,83 @@ class CaptureTelegram:
 
 
 class DragonflyPosterTests(unittest.TestCase):
+    def test_export_and_import_state_archive_roundtrip(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source_db = root / 'source.sqlite3'
+            source_accounts = root / 'accounts.json'
+            backup = root / 'backup.tar.gz'
+            con = poster.init_db(source_db)
+            con.execute("INSERT INTO sent_posts(post_id, sent_at, status) VALUES (?, ?, ?)", (123, 'now', 'sent'))
+            con.commit()
+            con.close()
+            source_accounts.write_text(json.dumps({
+                'active': 'main',
+                'accounts': [{'name': 'main', 'access_token': 'secret-token', 'enabled': True}],
+            }), encoding='utf-8')
+            c = cfg()
+            c.db_path = source_db
+            c.accounts_file = str(source_accounts)
+
+            manifest = poster.export_state_archive(c, backup)
+
+            self.assertTrue(backup.exists())
+            self.assertEqual(manifest['version'], 1)
+            with tarfile.open(backup, 'r:gz') as tf:
+                names = set(tf.getnames())
+                manifest_data = json.loads(tf.extractfile('manifest.json').read().decode('utf-8'))
+            self.assertIn('state/dragonfly_telegram_poster.sqlite3', names)
+            self.assertIn('secrets/dragonfly_accounts.json', names)
+            self.assertNotIn('dragonfly.env', names)
+            self.assertNotIn('secret-token', json.dumps(manifest_data))
+
+            target_db = root / 'restored.sqlite3'
+            target_accounts = root / 'restored_accounts.json'
+            restored = poster.import_state_archive(backup, db_path=target_db, accounts_file=target_accounts)
+
+            self.assertEqual(restored['version'], 1)
+            restored_con = poster.sqlite3.connect(target_db)
+            self.assertEqual(restored_con.execute('SELECT post_id FROM sent_posts').fetchone()[0], 123)
+            self.assertEqual(json.loads(target_accounts.read_text())['accounts'][0]['access_token'], 'secret-token')
+
+    def test_state_archive_cli_commands_print_safe_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source_db = root / 'source.sqlite3'
+            source_accounts = root / 'accounts.json'
+            backup = root / 'backup.tar.gz'
+            con = poster.init_db(source_db)
+            con.execute("INSERT INTO sent_posts(post_id, sent_at, status) VALUES (?, ?, ?)", (456, 'now', 'sent'))
+            con.commit()
+            con.close()
+            source_accounts.write_text(json.dumps({'active': 'main', 'accounts': [{'name': 'main', 'access_token': 'secret-token', 'enabled': True}]}), encoding='utf-8')
+            c = cfg()
+            c.db_path = source_db
+            c.accounts_file = str(source_accounts)
+            buf = io.StringIO()
+            old_stdout = sys.stdout
+            sys.stdout = buf
+            try:
+                self.assertEqual(poster.cmd_export_state(c, None, poster.argparse.Namespace(output=str(backup))), 0)
+            finally:
+                sys.stdout = old_stdout
+            self.assertIn('exported state archive', buf.getvalue())
+            self.assertNotIn('secret-token', buf.getvalue())
+
+            target_db = root / 'target.sqlite3'
+            target_accounts = root / 'target_accounts.json'
+            import_buf = io.StringIO()
+            old_stdout = sys.stdout
+            sys.stdout = import_buf
+            try:
+                self.assertEqual(poster.cmd_import_state(None, None, poster.argparse.Namespace(archive=str(backup), db=str(target_db), accounts_file=str(target_accounts))), 0)
+            finally:
+                sys.stdout = old_stdout
+            self.assertIn('imported state archive', import_buf.getvalue())
+            self.assertNotIn('secret-token', import_buf.getvalue())
+            self.assertTrue(target_db.exists())
+            self.assertTrue(target_accounts.exists())
+
     def test_configure_active_account_can_pin_named_account_without_rewriting_active(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / 'accounts.json'

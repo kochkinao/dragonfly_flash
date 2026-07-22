@@ -341,7 +341,42 @@ python3 scripts/install_systemd_user.py --project-dir "$PWD" --env-file ~/dragon
 
 `doctor --no-network` проверяет локальные prerequisites: env/config, account pool, writable SQLite/log paths, systemd templates. `doctor` дополнительно проверяет Telegram `getMe`/`getChat` и доступность Dragonfly feed. Команда не печатает токены/cookie.
 
-Не переносите в Git реальные `.env`, cookie jar, SQLite state, логи, токены или SSH keys.
+### Backup/restore runtime state
+
+Перед переносом сервера создайте архив состояния на старом сервере:
+
+```bash
+python3 dragonfly_telegram_poster.py \
+  --env-file ~/dragonfly.env \
+  export-state --output ~/dragonfly-state-$(date +%Y%m%d-%H%M%S).tar.gz
+```
+
+Архив содержит:
+
+```text
+manifest.json
+state/dragonfly_telegram_poster.sqlite3
+secrets/dragonfly_accounts.json, если DRAGONFLY_ACCOUNTS_FILE задан
+```
+
+Архив намеренно не содержит `.env`, cookie jar, логи, SSH keys или PM2/systemd runtime files. Сам архив создаётся с правами `0600`, потому что account pool внутри него содержит реальные Dragonfly access tokens.
+
+На новом сервере восстановите состояние после clone и настройки `~/dragonfly.env`:
+
+```bash
+python3 dragonfly_telegram_poster.py \
+  import-state ~/dragonfly-state-YYYYMMDD-HHMMSS.tar.gz \
+  --db ~/.hermes/state/dragonfly_telegram_poster.sqlite3 \
+  --accounts-file ~/.dragonfly_accounts.json
+```
+
+После restore проверьте:
+
+```bash
+python3 dragonfly_telegram_poster.py --env-file ~/dragonfly.env doctor
+```
+
+Не переносите в Git реальные `.env`, cookie jar, SQLite state, логи, токены, SSH keys или `Domain name.txt`.
 
 ## Загрузка треков в Dragonfly
 

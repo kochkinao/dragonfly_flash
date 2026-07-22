@@ -30,6 +30,7 @@ import os
 import re
 import sqlite3
 import sys
+import tarfile
 import tempfile
 import time
 import traceback
@@ -446,6 +447,138 @@ def init_db(path: Path) -> sqlite3.Connection:
             con.execute(ddl)
     con.commit()
     return con
+
+
+def _sqlite_snapshot(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    src = sqlite3.connect(source)
+    try:
+        dst = sqlite3.connect(target)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+
+def export_state_archive(cfg: Config, output_path: Path | str) -> dict[str, Any]:
+    """Export portable runtime state for server migration.
+
+    The archive intentionally includes SQLite state and optional account pool, but
+    never includes .env/cookie jars/logs. Manifest contains metadata only, not
+    access tokens.
+    """
+    output = Path(output_path).expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    db_path = Path(cfg.db_path).expanduser()
+    if not db_path.exists():
+        raise SystemExit(f"SQLite state DB not found: {db_path}")
+    accounts_path = Path(cfg.accounts_file).expanduser() if cfg.accounts_file else None
+    if accounts_path and not accounts_path.exists():
+        raise SystemExit(f"Dragonfly accounts file not found: {accounts_path}")
+
+    manifest = {
+        "version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "contains": {
+            "sqlite": True,
+            "accounts": bool(accounts_path),
+            "env": False,
+            "logs": False,
+        },
+        "source": {
+            "db_name": db_path.name,
+            "accounts_name": accounts_path.name if accounts_path else None,
+        },
+    }
+    if accounts_path:
+        try:
+            data = load_accounts_file(str(accounts_path)) or {}
+            manifest["accounts"] = {
+                "active": data.get("active"),
+                "enabled_names": [str(a.get("name") or "") for a in _enabled_accounts(data)],
+            }
+        except Exception:
+            manifest["accounts"] = {"active": None, "enabled_names": []}
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp_root = Path(td)
+        tmp_db = tmp_root / "dragonfly_telegram_poster.sqlite3"
+        _sqlite_snapshot(db_path, tmp_db)
+        tmp_manifest = tmp_root / "manifest.json"
+        tmp_manifest.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        with tarfile.open(output, "w:gz") as tf:
+            tf.add(tmp_manifest, arcname="manifest.json")
+            tf.add(tmp_db, arcname="state/dragonfly_telegram_poster.sqlite3")
+            if accounts_path:
+                tf.add(accounts_path, arcname="secrets/dragonfly_accounts.json")
+    try:
+        output.chmod(0o600)
+    except Exception:
+        pass
+    return manifest
+
+
+def _safe_extract_member(tf: tarfile.TarFile, member_name: str, target: Path) -> None:
+    try:
+        member = tf.getmember(member_name)
+    except KeyError as e:
+        raise SystemExit(f"State archive missing {member_name}") from e
+    if member.name.startswith("/") or ".." in Path(member.name).parts:
+        raise SystemExit(f"Unsafe archive path: {member.name}")
+    src = tf.extractfile(member)
+    if src is None:
+        raise SystemExit(f"State archive member is not a file: {member_name}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_bytes(src.read())
+    os.replace(tmp, target)
+
+
+def import_state_archive(archive_path: Path | str, *, db_path: Path | str, accounts_file: Path | str | None = None) -> dict[str, Any]:
+    archive = Path(archive_path).expanduser()
+    if not archive.exists():
+        raise SystemExit(f"State archive not found: {archive}")
+    target_db = Path(db_path).expanduser()
+    target_accounts = Path(accounts_file).expanduser() if accounts_file else None
+    with tarfile.open(archive, "r:gz") as tf:
+        manifest_member = tf.extractfile("manifest.json")
+        if manifest_member is None:
+            raise SystemExit("State archive missing manifest.json")
+        manifest = json.loads(manifest_member.read().decode("utf-8"))
+        _safe_extract_member(tf, "state/dragonfly_telegram_poster.sqlite3", target_db)
+        if target_accounts:
+            try:
+                _safe_extract_member(tf, "secrets/dragonfly_accounts.json", target_accounts)
+                try:
+                    target_accounts.chmod(0o600)
+                except Exception:
+                    pass
+            except SystemExit:
+                if manifest.get("contains", {}).get("accounts"):
+                    raise
+    return manifest
+
+
+def cmd_export_state(cfg: Config, con: sqlite3.Connection | None, args: argparse.Namespace) -> int:
+    manifest = export_state_archive(cfg, Path(args.output))
+    print(f"exported state archive: {Path(args.output).expanduser()}")
+    print(f"contains sqlite={manifest['contains']['sqlite']} accounts={manifest['contains']['accounts']} env={manifest['contains']['env']} logs={manifest['contains']['logs']}")
+    if manifest.get("accounts"):
+        names = ", ".join(manifest["accounts"].get("enabled_names", []))
+        print(f"accounts included: {names}")
+    return 0
+
+
+def cmd_import_state(cfg: Config | None, con: sqlite3.Connection | None, args: argparse.Namespace) -> int:
+    manifest = import_state_archive(Path(args.archive), db_path=Path(args.db), accounts_file=Path(args.accounts_file) if args.accounts_file else None)
+    print(f"imported state archive: {Path(args.archive).expanduser()}")
+    print(f"restored sqlite: {Path(args.db).expanduser()}")
+    if args.accounts_file:
+        print(f"restored accounts file: {Path(args.accounts_file).expanduser()}")
+    print(f"manifest version: {manifest.get('version')}")
+    return 0
 
 
 def is_sent(con: sqlite3.Connection, post_id: int) -> bool:
@@ -2576,6 +2709,12 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("doctor", help="check migration/runtime prerequisites without printing secrets")
     s.add_argument("--project-dir", default=str(Path(__file__).resolve().parent), help="repo checkout path for systemd template checks")
     s.add_argument("--no-network", action="store_true", help="skip Telegram/Dragonfly live network checks")
+    s = sub.add_parser("export-state", help="create a portable tar.gz backup of SQLite state and optional account pool")
+    s.add_argument("--output", required=True, help="output .tar.gz path; archive is chmod 600")
+    s = sub.add_parser("import-state", help="restore SQLite state and optional account pool from export-state archive")
+    s.add_argument("archive", help="archive created by export-state")
+    s.add_argument("--db", default=str(DEFAULT_DB), help="target SQLite DB path")
+    s.add_argument("--accounts-file", default=None, help="target Dragonfly accounts JSON path; omitted means restore DB only")
 
     s = sub.add_parser("init", help="mark recent posts as seen without sending")
     s.add_argument("--count", type=int, default=20)
@@ -2665,6 +2804,10 @@ def main() -> int:
         accounts_file=args.accounts_file or optional_env("DRAGONFLY_ACCOUNTS_FILE"),
         account_name=args.dragonfly_account or None,
     )
+    if args.cmd == "import-state":
+        return cmd_import_state(None, None, args)
+    if args.cmd == "export-state":
+        return cmd_export_state(cfg, None, args)
     if args.cmd == "doctor":
         try:
             configure_active_account(cfg)
