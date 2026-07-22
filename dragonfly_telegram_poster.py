@@ -771,13 +771,14 @@ def try_capture_discussion_mapping(
     role: str,
     channel_message_id: int | None,
     wait_seconds: float = 8.0,
+    update_timeout: int = 2,
 ) -> int | None:
     if not cfg.discussion_chat_id or not channel_message_id:
         return None
     deadline = time.monotonic() + wait_seconds
     while True:
         try:
-            updates = tg_get_updates(cfg, con, timeout=2)
+            updates = tg_get_updates(cfg, con, timeout=int(update_timeout))
         except Exception as e:
             log(f"discussion mapping getUpdates failed post #{post_id}: {e}", logging.WARNING)
             return None
@@ -2301,6 +2302,7 @@ def cmd_repair_discussion_mapping(cfg: Config, con: sqlite3.Connection, args: ar
             role=str(row["role"]),
             channel_message_id=int(row["message_id"]),
             wait_seconds=float(getattr(args, "wait_seconds", 0)),
+            update_timeout=int(getattr(args, "update_timeout", 0)),
         )
         if did is not None:
             repaired += 1
@@ -2456,6 +2458,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("repair-discussion-mapping", help="retry mapping channel posts to Telegram discussion messages")
     s.add_argument("--count", type=int, default=200, help="missing role=last mappings to inspect")
     s.add_argument("--wait-seconds", type=float, default=0.0, help="seconds to wait for updates per missing mapping")
+    s.add_argument("--update-timeout", type=int, default=0, help="Bot API getUpdates timeout per attempt; keep 0 for fast one-shot repair")
 
     s = sub.add_parser("sync-comments", help="one-shot mirror of new Dragonfly comments into Telegram discussion")
     s.add_argument("--count", type=int, default=20, help="recent Dragonfly posts to inspect")

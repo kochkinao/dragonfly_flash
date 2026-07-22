@@ -295,10 +295,10 @@ Dragonfly post_id + role=last -> discussion_message_id
 ```bash
 python3 dragonfly_telegram_poster.py \
   --env-file /home/wacotal/dragonfly.env \
-  repair-discussion-mapping --count 200 --wait-seconds 0
+  repair-discussion-mapping --count 200 --wait-seconds 0 --update-timeout 0
 ```
 
-Это полезно после временных `getUpdates` timeout'ов. Команда ищет `telegram_messages.role='last'` без строки в `telegram_discussion_messages` и пробует сопоставить их с доступными Telegram updates.
+Это полезно после временных `getUpdates` timeout'ов. Команда ищет `telegram_messages.role='last'` без строки в `telegram_discussion_messages` и пробует сопоставить их с доступными Telegram updates. Для production repair держите `--update-timeout 0`, чтобы проход по сотням missing rows не зависал на long polling; если нужно подождать новые automatic forwards, временно остановите другой `getUpdates` consumer и задайте `--wait-seconds`/`--update-timeout` явно.
 
 Это подготовка для зеркалирования комментариев: если Dragonfly-пост разбит на несколько Telegram-сообщений, комментарии нужно отправлять reply именно к `role=last`.
 
