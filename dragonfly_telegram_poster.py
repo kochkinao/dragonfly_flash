@@ -62,6 +62,15 @@ MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 DEFAULT_API_429_BASE_SLEEP = 30.0
 DEFAULT_API_429_MAX_SLEEP = 900.0
 COMMENT_SEND_RESERVED_MESSAGE_ID = -1
+DOCTOR_EXPECTED_SYSTEMD_UNITS = {
+    "dragonfly-bridge.target",
+    "dragonfly-watch.service",
+    "dragonfly-stats-hot.service",
+    "dragonfly-stats-cold.service",
+    "dragonfly-comments-0.service",
+    "dragonfly-comments-17.service",
+    "dragonfly-comments-34.service",
+}
 
 
 @dataclass
@@ -2394,6 +2403,103 @@ def cmd_sync_comments_watch(cfg: Config, con: sqlite3.Connection, args: argparse
         time.sleep(float(args.interval))
 
 
+def doctor_add(lines: list[str], ok: bool, label: str, detail: str = "") -> bool:
+    prefix = "OK" if ok else "FAIL"
+    lines.append(f"{prefix} {label}{(': ' + detail) if detail else ''}")
+    return ok
+
+
+def _path_writable(path: Path, *, is_file: bool) -> bool:
+    target_dir = path.parent if is_file else path
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(prefix=".dragonfly-doctor-", dir=str(target_dir), delete=True) as f:
+        f.write(b"ok")
+        f.flush()
+    return True
+
+
+def run_doctor(cfg: Config, *, project_dir: Path | None = None, check_network: bool = True) -> dict[str, Any]:
+    """Check migration/runtime prerequisites without printing secrets."""
+    project_dir = (project_dir or Path(__file__).resolve().parent).expanduser().resolve()
+    lines: list[str] = ["Dragonfly bridge doctor"]
+    ok = True
+
+    ok &= doctor_add(lines, bool(cfg.telegram_token), "telegram bot token configured")
+    ok &= doctor_add(lines, bool(cfg.telegram_chat_id), "telegram channel configured", str(cfg.telegram_chat_id or ""))
+    doctor_add(lines, bool(cfg.alert_chat_id), "telegram alert chat configured", str(cfg.alert_chat_id or "optional"))
+    doctor_add(lines, bool(cfg.discussion_chat_id), "telegram discussion chat configured", str(cfg.discussion_chat_id or "optional"))
+    doctor_add(lines, bool(cfg.best_chat_id), "telegram best channel configured", str(cfg.best_chat_id or "optional"))
+    ok &= doctor_add(lines, bool(cfg.dragonfly_user_id), "Dragonfly user id configured", str(cfg.dragonfly_user_id or ""))
+
+    auth_ok = bool(cfg.accounts_file or cfg.cookie_file or cfg.dragonfly_token)
+    ok &= doctor_add(lines, auth_ok, "Dragonfly auth configured")
+
+    if cfg.accounts_file:
+        try:
+            data = load_accounts_file(cfg.accounts_file) or {}
+            accounts = _enabled_accounts(data)
+            names = {str(a.get("name") or "") for a in accounts}
+            expected = {"main", "backup_1", "backup_2", "backup_3", "backup_4"}
+            missing = sorted(expected - names)
+            ok &= doctor_add(lines, not missing, "accounts file has expected accounts", f"enabled={', '.join(sorted(names))}" if not missing else f"missing={', '.join(missing)}")
+        except Exception as e:
+            ok &= doctor_add(lines, False, "accounts file readable", str(e))
+    else:
+        doctor_add(lines, False, "accounts file configured", "optional but recommended for production")
+
+    try:
+        _path_writable(Path(cfg.db_path).expanduser(), is_file=True)
+        ok &= doctor_add(lines, True, "sqlite path writable", str(Path(cfg.db_path).expanduser()))
+    except Exception as e:
+        ok &= doctor_add(lines, False, "sqlite path writable", str(e))
+
+    if cfg.log_file:
+        try:
+            _path_writable(Path(cfg.log_file).expanduser(), is_file=True)
+            ok &= doctor_add(lines, True, "log path writable", str(Path(cfg.log_file).expanduser()))
+        except Exception as e:
+            ok &= doctor_add(lines, False, "log path writable", str(e))
+    else:
+        doctor_add(lines, True, "log file disabled")
+
+    unit_dir = project_dir / "deploy" / "systemd" / "user"
+    existing_units = {p.name for p in unit_dir.glob("dragonfly-*")}
+    missing_units = sorted(DOCTOR_EXPECTED_SYSTEMD_UNITS - existing_units)
+    ok &= doctor_add(lines, not missing_units, "systemd templates present", "all" if not missing_units else f"missing={', '.join(missing_units)}")
+
+    if check_network:
+        try:
+            me = tg_request(cfg, "getMe", {}) if cfg.telegram_token else None
+            ok &= doctor_add(lines, bool(me and me.get("ok", True)), "Telegram getMe reachable")
+            for label, chat_id in (
+                ("Telegram channel reachable", cfg.telegram_chat_id),
+                ("Telegram discussion chat reachable", cfg.discussion_chat_id),
+                ("Telegram best channel reachable", cfg.best_chat_id),
+            ):
+                if not chat_id:
+                    continue
+                tg_request(cfg, "getChat", {"chat_id": str(chat_id)})
+                ok &= doctor_add(lines, True, label, str(chat_id))
+        except Exception as e:
+            ok &= doctor_add(lines, False, "Telegram getMe reachable", str(e)[:200])
+        try:
+            sample = fetch_recent_posts(cfg, 1)
+            ok &= doctor_add(lines, bool(sample), "Dragonfly feed reachable", f"sample_posts={len(sample)}")
+        except Exception as e:
+            ok &= doctor_add(lines, False, "Dragonfly feed reachable", str(e)[:200])
+    else:
+        doctor_add(lines, True, "network checks skipped")
+
+    return {"ok": bool(ok), "lines": lines}
+
+
+def cmd_doctor(cfg: Config, con: sqlite3.Connection | None, args: argparse.Namespace) -> int:
+    result = run_doctor(cfg, project_dir=Path(getattr(args, "project_dir", ".")), check_network=not bool(getattr(args, "no_network", False)))
+    for line in result["lines"]:
+        print(line)
+    return 0 if result["ok"] else 1
+
+
 def cmd_sync_stats(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
     old_limit = cfg.limit
     cfg.limit = int(args.count)
@@ -2467,6 +2573,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("auth-check", help="check Dragonfly authentication and exit")
+    s = sub.add_parser("doctor", help="check migration/runtime prerequisites without printing secrets")
+    s.add_argument("--project-dir", default=str(Path(__file__).resolve().parent), help="repo checkout path for systemd template checks")
+    s.add_argument("--no-network", action="store_true", help="skip Telegram/Dragonfly live network checks")
 
     s = sub.add_parser("init", help="mark recent posts as seen without sending")
     s.add_argument("--count", type=int, default=20)
@@ -2556,6 +2665,12 @@ def main() -> int:
         accounts_file=args.accounts_file or optional_env("DRAGONFLY_ACCOUNTS_FILE"),
         account_name=args.dragonfly_account or None,
     )
+    if args.cmd == "doctor":
+        try:
+            configure_active_account(cfg)
+        except Exception as e:
+            log(f"doctor account activation skipped: {e}", logging.WARNING)
+        return cmd_doctor(cfg, None, args)
     configure_active_account(cfg)
     if not cfg.cookie_file and not cfg.dragonfly_token:
         raise SystemExit("Set DRAGONFLY_COOKIE_FILE, DRAGONFLY_ACCESS_TOKEN, or DRAGONFLY_ACCOUNTS_FILE")

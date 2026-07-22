@@ -117,6 +117,68 @@ class DragonflyPosterTests(unittest.TestCase):
         warnings = [m for m, level in logs if 'gap catch-up skipped' in m]
         self.assertEqual(warnings, ['gap catch-up skipped: span=1000 exceeds max_gap_scan=10'])
 
+    def test_doctor_checks_local_migration_prerequisites_without_leaking_secrets(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            accounts = root / 'accounts.json'
+            accounts.write_text(json.dumps({
+                'active': 'main',
+                'accounts': [
+                    {'name': 'main', 'access_token': 'tok-main', 'enabled': True},
+                    {'name': 'backup_1', 'access_token': 'tok-b1', 'enabled': True},
+                    {'name': 'backup_2', 'access_token': 'tok-b2', 'enabled': True},
+                    {'name': 'backup_3', 'access_token': 'tok-b3', 'enabled': True},
+                    {'name': 'backup_4', 'access_token': 'tok-b4', 'enabled': True},
+                ],
+            }), encoding='utf-8')
+            unit_dir = root / 'deploy' / 'systemd' / 'user'
+            unit_dir.mkdir(parents=True)
+            for name in poster.DOCTOR_EXPECTED_SYSTEMD_UNITS:
+                (unit_dir / name).write_text('[Unit]\nDescription=test\n', encoding='utf-8')
+            c = cfg()
+            c.telegram_token = 'tg-secret-token'
+            c.telegram_chat_id = '@channel'
+            c.alert_chat_id = '123'
+            c.discussion_chat_id = '-100222'
+            c.best_chat_id = '-100333'
+            c.accounts_file = str(accounts)
+            c.db_path = root / 'state.sqlite3'
+            c.log_file = str(root / 'bridge.log')
+
+            result = poster.run_doctor(c, project_dir=root, check_network=False)
+
+        rendered = '\n'.join(result['lines'])
+        self.assertTrue(result['ok'], rendered)
+        self.assertIn('OK accounts file has expected accounts', rendered)
+        self.assertIn('OK sqlite path writable', rendered)
+        self.assertIn('OK log path writable', rendered)
+        self.assertNotIn('tok-main', rendered)
+        self.assertNotIn('tg-secret-token', rendered)
+
+    def test_doctor_network_checks_telegram_chats(self):
+        c = cfg()
+        c.telegram_token = 'tg-secret-token'
+        c.telegram_chat_id = '@channel'
+        c.discussion_chat_id = '-100222'
+        c.best_chat_id = '-100333'
+        c.accounts_file = None
+        calls = []
+        orig_tg = poster.tg_request
+        orig_fetch = poster.fetch_recent_posts
+        poster.tg_request = lambda cfg, method, payload: calls.append((method, payload)) or {'ok': True, 'result': {'id': payload.get('chat_id', 1)}}
+        poster.fetch_recent_posts = lambda cfg, count: [post(post_id=1)]
+        try:
+            result = poster.run_doctor(c, project_dir=Path(__file__).parent, check_network=True)
+        finally:
+            poster.tg_request = orig_tg
+            poster.fetch_recent_posts = orig_fetch
+
+        self.assertTrue(result['ok'], '\n'.join(result['lines']))
+        self.assertIn(('getMe', {}), calls)
+        self.assertIn(('getChat', {'chat_id': '@channel'}), calls)
+        self.assertIn(('getChat', {'chat_id': '-100222'}), calls)
+        self.assertIn(('getChat', {'chat_id': '-100333'}), calls)
+
     def test_fetch_recent_posts_honors_start_offset(self):
         c = cfg()
         c.limit = 10

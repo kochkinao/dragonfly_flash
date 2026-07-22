@@ -333,9 +333,13 @@ cp dragonfly.env.example ~/dragonfly.env
 cp dragonfly_accounts.example.json ~/.dragonfly_accounts.json
 chmod 600 ~/dragonfly.env ~/.dragonfly_accounts.json
 # заполнить реальные Telegram/Dragonfly значения в ~/dragonfly.env и ~/.dragonfly_accounts.json
+python3 dragonfly_telegram_poster.py --env-file ~/dragonfly.env doctor --no-network
+python3 dragonfly_telegram_poster.py --env-file ~/dragonfly.env doctor
 python3 dragonfly_telegram_poster.py --env-file ~/dragonfly.env auth-check
 python3 scripts/install_systemd_user.py --project-dir "$PWD" --env-file ~/dragonfly.env --enable --start
 ```
+
+`doctor --no-network` проверяет локальные prerequisites: env/config, account pool, writable SQLite/log paths, systemd templates. `doctor` дополнительно проверяет Telegram `getMe`/`getChat` и доступность Dragonfly feed. Команда не печатает токены/cookie.
 
 Не переносите в Git реальные `.env`, cookie jar, SQLite state, логи, токены или SSH keys.
 
