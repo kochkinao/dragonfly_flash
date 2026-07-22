@@ -428,21 +428,22 @@ git clone git@github.com:kochkinao/dragonfly_flash.git
 cd dragonfly_flash
 git checkout prod
 
-# secrets/state: НЕ из Git
-cp dragonfly.env.example ~/dragonfly.env
-chmod 600 ~/dragonfly.env
-# заполнить ~/dragonfly.env реальными значениями
+# secrets/state: НЕ из Git и НЕ в ~/.hermes другого Hermes
+mkdir -p ~/dragonfly/state ~/dragonfly/logs
+cp dragonfly.env.example ~/dragonfly/dragonfly.env
+chmod 600 ~/dragonfly/dragonfly.env
+# заполнить ~/dragonfly/dragonfly.env реальными значениями
 
 # если переносим существующий runtime state:
 python3 dragonfly_telegram_poster.py \
   import-state ~/dragonfly-state-YYYYMMDD-HHMMSS.tar.gz \
-  --db ~/.hermes/state/dragonfly_telegram_poster.sqlite3 \
-  --accounts-file ~/.dragonfly_accounts.json
+  --db ~/dragonfly/state/dragonfly_telegram_poster.sqlite3 \
+  --accounts-file ~/dragonfly/state/dragonfly_accounts.json
 
-python3 dragonfly_telegram_poster.py --env-file ~/dragonfly.env doctor --no-network
-python3 dragonfly_telegram_poster.py --env-file ~/dragonfly.env doctor
+python3 dragonfly_telegram_poster.py --env-file ~/dragonfly/dragonfly.env --db ~/dragonfly/state/dragonfly_telegram_poster.sqlite3 --log-file ~/dragonfly/logs/dragonfly_telegram_poster.log doctor --no-network
+python3 dragonfly_telegram_poster.py --env-file ~/dragonfly/dragonfly.env --db ~/dragonfly/state/dragonfly_telegram_poster.sqlite3 --log-file ~/dragonfly/logs/dragonfly_telegram_poster.log doctor
 
-DRAGONFLY_ENV_FILE=~/dragonfly.env pm2 startOrReload ecosystem.config.cjs --update-env
+DRAGONFLY_ENV_FILE=~/dragonfly/dragonfly.env DRAGONFLY_STATE_DIR=~/dragonfly/state DRAGONFLY_LOG_DIR=~/dragonfly/logs pm2 startOrReload ecosystem.config.cjs --update-env
 pm2 save
 pm2 startup
 ```
@@ -460,7 +461,7 @@ scripts/pm2_status.sh
 
 ```bash
 cd ~/apps/dragonfly_flash
-DRAGONFLY_ENV_FILE=~/dragonfly.env scripts/deploy_prod.sh
+DRAGONFLY_ENV_FILE=~/dragonfly/dragonfly.env DRAGONFLY_STATE_DIR=~/dragonfly/state DRAGONFLY_LOG_DIR=~/dragonfly/logs scripts/deploy_prod.sh
 ```
 
 `deploy_prod.sh` делает:
@@ -469,7 +470,7 @@ DRAGONFLY_ENV_FILE=~/dragonfly.env scripts/deploy_prod.sh
 git fetch origin prod
 git reset --hard origin/prod
 python3 -m py_compile ...
-python3 dragonfly_telegram_poster.py --env-file "$DRAGONFLY_ENV_FILE" doctor --no-network
+python3 dragonfly_telegram_poster.py --env-file "$DRAGONFLY_ENV_FILE" --db "$DRAGONFLY_STATE_DIR/dragonfly_telegram_poster.sqlite3" doctor --no-network
 pm2 startOrReload ecosystem.config.cjs --update-env
 pm2 save
 ```
@@ -480,7 +481,10 @@ pm2 save
 
 ```bash
 cd ~/apps/dragonfly_flash
-PM2_DEPLOY_INTERVAL=60 DRAGONFLY_ENV_FILE=~/dragonfly.env \
+PM2_DEPLOY_INTERVAL=60 \
+DRAGONFLY_ENV_FILE=~/dragonfly/dragonfly.env \
+DRAGONFLY_STATE_DIR=~/dragonfly/state \
+DRAGONFLY_LOG_DIR=~/dragonfly/logs \
   pm2 start scripts/prod_branch_poller.sh --name dragonfly-prod-poller --interpreter bash
 pm2 save
 ```
@@ -490,7 +494,9 @@ pm2 save
 Переменные:
 
 ```text
-DRAGONFLY_ENV_FILE      default: ~/dragonfly.env
+DRAGONFLY_ENV_FILE      default: ~/dragonfly/dragonfly.env
+DRAGONFLY_STATE_DIR     default: ~/dragonfly/state
+DRAGONFLY_LOG_DIR       default: ~/dragonfly/logs
 PM2_DEPLOY_REMOTE       default: origin
 PM2_DEPLOY_BRANCH       default: prod
 PM2_DEPLOY_INTERVAL     default: 60

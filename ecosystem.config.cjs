@@ -1,11 +1,17 @@
 // PM2 production process file for Dragonfly Flash Telegram bridge.
 // Secrets are loaded by dragonfly_telegram_poster.py from DRAGONFLY_ENV_FILE;
 // keep real tokens in ~/dragonfly.env, never in this repository.
-const envFile = process.env.DRAGONFLY_ENV_FILE || `${process.env.HOME}/dragonfly.env`;
+const envFile = process.env.DRAGONFLY_ENV_FILE || `${process.env.HOME}/dragonfly/dragonfly.env`;
+const stateDir = process.env.DRAGONFLY_STATE_DIR || `${process.env.HOME}/dragonfly/state`;
+const logDir = process.env.DRAGONFLY_LOG_DIR || `${process.env.HOME}/dragonfly/logs`;
 const python = process.env.PYTHON || 'python3';
+const dbFile = `${stateDir}/dragonfly_telegram_poster.sqlite3`;
+const appLogFile = `${logDir}/dragonfly_telegram_poster.log`;
 const baseEnv = {
   PYTHONUNBUFFERED: '1',
   DRAGONFLY_ENV_FILE: envFile,
+  DRAGONFLY_STATE_DIR: stateDir,
+  DRAGONFLY_LOG_DIR: logDir,
 };
 
 function app(name, args, extraEnv = {}) {
@@ -21,14 +27,19 @@ function app(name, args, extraEnv = {}) {
     restart_delay: 10000,
     kill_timeout: 15000,
     env: { ...baseEnv, ...extraEnv },
-    out_file: `${process.env.HOME}/.hermes/logs/${name}.out.log`,
-    error_file: `${process.env.HOME}/.hermes/logs/${name}.err.log`,
+    out_file: `${logDir}/${name}.out.log`,
+    error_file: `${logDir}/${name}.err.log`,
     merge_logs: true,
     time: true,
   };
 }
 
-const common = ['dragonfly_telegram_poster.py', '--env-file', envFile];
+const common = [
+  'dragonfly_telegram_poster.py',
+  '--env-file', envFile,
+  '--db', dbFile,
+  '--log-file', appLogFile,
+];
 
 module.exports = {
   apps: [
