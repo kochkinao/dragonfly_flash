@@ -835,6 +835,49 @@ class DragonflyPosterTests(unittest.TestCase):
         row = con.execute('SELECT telegram_message_id FROM dragonfly_comments WHERE post_id=904 AND comment_id=10').fetchone()
         self.assertEqual(row, (901,))
 
+    def test_sync_comments_updates_stats_footer_after_sending_comment(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        c.telegram_token = 'tg'
+        poster.save_discussion_message(
+            con,
+            post_id=905,
+            role='last',
+            channel_chat_id='@channel',
+            channel_message_id=555,
+            discussion_chat_id='-100222',
+            discussion_message_id=777,
+        )
+        poster.record_telegram_message(
+            con,
+            post(post_id=905, likes_count=2, comments_count=0),
+            chat_id='@channel',
+            message_id=500,
+            message_kind='text',
+            base_html='base',
+            role='main',
+        )
+        calls = []
+        orig_fetch_posts = poster.fetch_recent_posts
+        orig_fetch_comments = poster.fetch_post_comments
+        orig_tg = poster.tg_request
+        poster.fetch_recent_posts = lambda cfg, count, start_offset=0: [post(post_id=905, likes_count=2, comments_count=0)]
+        poster.fetch_post_comments = lambda cfg, pid: [{'id': 20, 'username': 'Alice', 'text': 'new', 'created_at': '2026-07-21T10:00:00', 'likes_count': 0}]
+        poster.tg_request = lambda cfg, method, payload: calls.append((method, payload)) or {'ok': True, 'result': {'message_id': 902}}
+        try:
+            rc = poster.cmd_sync_comments(c, con, type('Args', (), {'count': 1, 'offset': 0, 'send_existing': True})())
+        finally:
+            poster.fetch_recent_posts = orig_fetch_posts
+            poster.fetch_post_comments = orig_fetch_comments
+            poster.tg_request = orig_tg
+
+        self.assertEqual(rc, 0)
+        self.assertEqual([m for m, _ in calls], ['sendMessage', 'editMessageText'])
+        self.assertIn('💬 1', calls[1][1]['text'])
+        row = con.execute("SELECT last_comments FROM telegram_messages WHERE post_id=905 AND role='main'").fetchone()
+        self.assertEqual(row, (1,))
+
     def test_sync_post_stats_edits_text_when_counts_change(self):
         con = poster.init_db(Path(':memory:'))
         c = cfg()

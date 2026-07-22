@@ -2169,6 +2169,11 @@ def cmd_sync_comments(cfg: Config, con: sqlite3.Connection, args: argparse.Names
             sent, marked = sync_post_comments(cfg, con, p, send_existing=bool(getattr(args, "send_existing", False)))
             total_sent += sent
             total_marked += marked
+            if sent > 0:
+                try:
+                    sync_post_stats(cfg, con, p)
+                except Exception as e:
+                    log_exception(f"comments-triggered stats sync failed post #{p.get('post_id')}", e)
         except Exception as e:
             log_exception(f"comments sync failed post #{p.get('post_id')}", e)
     log(f"sync-comments done checked={checked} sent={total_sent} marked_existing={total_marked}")

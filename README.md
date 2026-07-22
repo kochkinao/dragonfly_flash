@@ -215,6 +215,22 @@ python3 dragonfly_telegram_poster.py \
   sync-stats-watch --count 20 --interval 60
 ```
 
+Практичный production-профиль для снижения нагрузки: самые свежие 20 постов обновлять раз в 30 секунд, посты 21–50 — раз в минуту:
+
+```bash
+python3 dragonfly_telegram_poster.py \
+  --env-file /home/wacotal/dragonfly.env \
+  --dragonfly-account backup_1 \
+  sync-stats-watch --count 20 --offset 0 --interval 30
+
+python3 dragonfly_telegram_poster.py \
+  --env-file /home/wacotal/dragonfly.env \
+  --dragonfly-account backup_1 \
+  sync-stats-watch --count 30 --offset 20 --interval 60
+```
+
+Когда comments watcher отправляет новые комментарии, он сразу запускает обновление stats-footer для этого поста, чтобы `💬` не ждал более медленного минутного окна.
+
 Для read-only распределения нагрузки можно закрепить watcher за отдельным аккаунтом из `DRAGONFLY_ACCOUNTS_FILE`, не меняя глобальный `active`:
 
 ```bash
