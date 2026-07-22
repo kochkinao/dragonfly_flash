@@ -130,6 +130,22 @@ def log_exception(msg: str, exc: BaseException) -> None:
     log(f"{msg}: {exc}\n{traceback.format_exc()}", logging.ERROR)
 
 
+def is_transient_network_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "handshake operation timed out",
+            "urlopen error",
+            "timed out",
+            "ssl eof",
+            "temporarily unavailable",
+            "connection reset",
+            "network error",
+        )
+    )
+
+
 def human_duration(seconds: float) -> str:
     seconds_i = int(round(seconds))
     if seconds_i < 60:
@@ -935,7 +951,6 @@ def api_get_json_dragonfly(cfg: Config, url: str) -> dict[str, Any]:
             return api_get_json(
                 url,
                 headers=dragonfly_headers(cfg),
-                alert=lambda msg: send_alert(cfg, "Dragonfly временно ограничил запросы", msg, level="warning"),
                 auth_alert=dragonfly_auth_alert(cfg),
                 opener=dragonfly_opener(cfg),
             )
@@ -1886,13 +1901,16 @@ def sync_post_stats(cfg: Config, con: sqlite3.Connection, post: dict[str, Any]) 
         # retryable except for obvious "message is not modified".
         msg = str(e)
         if "message is not modified" not in msg.lower():
-            log_exception(f"stats edit failed post #{pid}", e)
+            if is_transient_network_error(e):
+                log(f"stats edit transient failure post #{pid}: {msg[:500]}", logging.WARNING)
+            else:
+                log_exception(f"stats edit failed post #{pid}", e)
+                send_alert(cfg, "Ошибка обновления статистики", f"Пост #{pid}: {msg[:500]}", level="warning")
             con.execute(
                 "UPDATE telegram_messages SET last_error = ? WHERE post_id = ? AND role = 'main'",
                 (msg[:1000], pid),
             )
             con.commit()
-            send_alert(cfg, "Ошибка обновления статистики", f"Пост #{pid}: {msg[:500]}", level="warning")
             return False
     update_telegram_message_stats(con, pid, likes, comments)
     log(f"stats updated post #{pid}: likes {old_likes}->{likes}, comments {old_comments}->{comments}")

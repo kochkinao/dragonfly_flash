@@ -891,6 +891,35 @@ class DragonflyPosterTests(unittest.TestCase):
         row = con.execute("SELECT last_comments FROM telegram_messages WHERE post_id=891").fetchone()
         self.assertEqual(row, (3,))
 
+    def test_sync_post_stats_suppresses_alert_for_transient_edit_network_error(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        poster.record_telegram_message(
+            con,
+            post(post_id=892, likes_count=1, comments_count=1),
+            chat_id='@channel',
+            message_id=502,
+            message_kind='text',
+            base_html='base',
+        )
+        alerts = []
+        orig_tg = poster.tg_request
+        orig_alert = poster.send_alert
+        poster.tg_request = lambda *_args, **_kwargs: (_ for _ in ()).throw(urllib.error.URLError('handshake operation timed out'))
+        poster.send_alert = lambda *_args, **_kwargs: alerts.append((_args, _kwargs))
+        try:
+            changed = poster.sync_post_stats(c, con, post(post_id=892, likes_count=2, comments_count=1))
+        finally:
+            poster.tg_request = orig_tg
+            poster.send_alert = orig_alert
+
+        self.assertFalse(changed)
+        self.assertEqual(alerts, [])
+        row = con.execute("SELECT last_likes, last_error FROM telegram_messages WHERE post_id=892").fetchone()
+        self.assertEqual(row[0], 1)
+        self.assertIn('handshake operation timed out', row[1])
+
     def test_sync_best_post_forwards_once_and_records_dedupe(self):
         con = poster.init_db(Path(':memory:'))
         c = cfg()
