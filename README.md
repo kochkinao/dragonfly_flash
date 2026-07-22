@@ -139,6 +139,8 @@ python3 dragonfly_telegram_poster.py \
   watch --max-gap-scan 200
 ```
 
+Если gap между видимыми post id стабильно больше `--max-gap-scan`, warning `gap catch-up skipped` логируется один раз для этого диапазона/лимита, а не на каждом 15-секундном цикле.
+
 ## Не отправлять старое, начать только с новых
 
 ```bash

@@ -1716,6 +1716,14 @@ def send_new_posts(cfg: Config, con: sqlite3.Connection, posts_newest_first: lis
     return sent
 
 
+def log_gap_catchup_skip_once(con: sqlite3.Connection, *, span: int, max_gap_scan: int, min_id: int, max_id: int) -> None:
+    key = f"gap_catchup_skip:{min_id}:{max_id}:{max_gap_scan}"
+    if kv_get(con, key):
+        return
+    log(f"gap catch-up skipped: span={span} exceeds max_gap_scan={max_gap_scan}", logging.WARNING)
+    kv_set(con, key, datetime.now(timezone.utc).isoformat())
+
+
 def catch_up_missing_ids(
     cfg: Config,
     con: sqlite3.Connection,
@@ -1736,7 +1744,7 @@ def catch_up_missing_ids(
         return 0
     span = max_id - min_id + 1
     if span > max_gap_scan:
-        log(f"gap catch-up skipped: span={span} exceeds max_gap_scan={max_gap_scan}", logging.WARNING)
+        log_gap_catchup_skip_once(con, span=span, max_gap_scan=max_gap_scan, min_id=min_id, max_id=max_id)
         return 0
 
     processed = 0

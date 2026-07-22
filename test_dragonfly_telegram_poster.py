@@ -102,6 +102,21 @@ class DragonflyPosterTests(unittest.TestCase):
             self.assertFalse(poster.switch_dragonfly_account(c, '401'))
             self.assertEqual(json.loads(path.read_text())['active'], 'main')
 
+    def test_gap_catchup_skip_warning_is_deduped_for_same_range(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        logs = []
+        orig_log = poster.log
+        poster.log = lambda message, level=poster.logging.INFO: logs.append((message, level))
+        try:
+            poster.catch_up_missing_ids(c, con, min_id=1, max_id=1000, known_ids=set(), max_gap_scan=10)
+            poster.catch_up_missing_ids(c, con, min_id=1, max_id=1000, known_ids=set(), max_gap_scan=10)
+        finally:
+            poster.log = orig_log
+
+        warnings = [m for m, level in logs if 'gap catch-up skipped' in m]
+        self.assertEqual(warnings, ['gap catch-up skipped: span=1000 exceeds max_gap_scan=10'])
+
     def test_fetch_recent_posts_honors_start_offset(self):
         c = cfg()
         c.limit = 10
