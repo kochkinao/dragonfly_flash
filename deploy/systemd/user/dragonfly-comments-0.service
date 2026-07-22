@@ -1,0 +1,22 @@
+[Unit]
+Description=Dragonfly Flash comments shard 0-16
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{PROJECT_DIR}}
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile={{ENV_FILE}}
+ExecStart=/usr/bin/python3 {{PROJECT_DIR}}/dragonfly_telegram_poster.py \
+  --env-file {{ENV_FILE}} \
+  --dragonfly-account backup_2 \
+  --request-delay 2 \
+  sync-comments-watch --count 17 --offset 0 --interval 30 --send-existing --hot-count 20
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=dragonfly-bridge.target

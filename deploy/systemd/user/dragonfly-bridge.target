@@ -1,0 +1,8 @@
+[Unit]
+Description=Dragonfly Flash Telegram bridge services
+Documentation=https://github.com/kochkinao/dragonfly_flash
+Wants=dragonfly-watch.service dragonfly-stats-hot.service dragonfly-stats-cold.service dragonfly-comments-0.service dragonfly-comments-17.service dragonfly-comments-34.service
+After=network-online.target
+
+[Install]
+WantedBy=default.target

@@ -21,11 +21,11 @@
 - Если медиа не отправилось, публикует fallback: текст + предупреждение + ссылка на оригинал.
 - Если пост всё равно падает, retry до `--max-attempts` раз, потом пропуск, чтобы не блокировать очередь.
 - Автоочистка SQLite: хранит только последние `--keep-sent` успешных записей, failed-записи сохраняет.
-- Логирует в stdout и файл `~/.hermes/logs/dragonfly_telegram_poster.log`; ошибки пишутся с traceback.
-- Дополнительно отправляет user-friendly предупреждения в личку (`TELEGRAM_ALERT_CHAT_ID`): 429, retry/wait, временные ошибки постов, permanent fail, watch-loop errors.
+- Логирует в stdout и файл `~/.hermes/logs/dragonfly_telegram_poster.log`; файл ротируется `10 MB × 5`.
+- Дополнительно отправляет user-friendly предупреждения в личку (`TELEGRAM_ALERT_CHAT_ID`): auth/permanent errors и важные failures; transient network/429 retry events остаются в логах без спама в Telegram.
 - При Telegram 429 ждёт `retry_after + 2` секунд и продолжает.
 - При Dragonfly 429 использует adaptive backoff: 30 сек → 1 мин → 2 мин → 4 мин → ... до 15 мин, чтобы временный rate limit не ронял процесс.
-- Telegram pacing гибкий по типам постов: `--text-delay`, `--photo-delay`, `--album-delay`, `--animation-delay`, `--mixed-media-delay`, `--media-item-delay`. Поэтому текст/обычные фото не тормозятся так же жёстко, как GIF/animation.
+- Telegram pacing гибкий по типам постов: `--text-delay`, `--photo-delay`, `--album-delay`, `--animation-delay`, `--mixed-media-delay`, `--media-item-delay`.
 
 ## .env
 
@@ -45,13 +45,13 @@ DRAGONFLY_COOKIE_FILE=/path/to/dragonfly_cookies.txt
 TELEGRAM_BOT_TOKEN=***
 TELEGRAM_CHAT_ID=@dragonfly_flash
 TELEGRAM_ALERT_CHAT_ID=123456789
-# Optional: linked discussion group for future comment mirroring.
 TELEGRAM_DISCUSSION_CHAT_ID=-100xxxxxxxxxx
-# Optional: account pool for 401/auth failover.
+TELEGRAM_BEST_CHAT_ID=-100xxxxxxxxxx
+DRAGONFLY_USER_ID=2723
 DRAGONFLY_ACCOUNTS_FILE=/path/to/dragonfly_accounts.json
 ```
 
-`DRAGONFLY_ACCESS_TOKEN` — legacy JWT fallback. Текущий сайт Dragonfly уже использует HttpOnly-cookie сессии, поэтому надёжнее перейти на `DRAGONFLY_COOKIE_FILE`.
+`DRAGONFLY_ACCESS_TOKEN` — legacy JWT fallback. Текущий сайт Dragonfly уже использует HttpOnly-cookie сессии, поэтому надёжнее перейти на `DRAGONFLY_COOKIE_FILE` или `DRAGONFLY_ACCOUNTS_FILE`.
 
 Проверка авторизации:
 
@@ -67,38 +67,32 @@ python3 dragonfly_telegram_poster.py \
 auth-check OK mode=cookie sample_posts=20
 ```
 
-или, пока используется JWT fallback:
+или:
 
 ```text
-auth-check OK mode=bearer-jwt sample_posts=20
+auth-check OK mode=accounts:main sample_posts=20
 ```
 
 Если Dragonfly вернёт `401`, скрипт отправит понятный alert в личку: авторизация истекла, нужно обновить cookie/JWT.
 
-### Несколько аккаунтов для failover
+### Несколько аккаунтов для failover/read-only watchers
 
 Можно указать JSON-файл с несколькими Dragonfly `access_token`:
 
-```json
-{
-  "active": "main",
-  "accounts": [
-    {"name": "main", "access_token": "...", "enabled": true},
-    {"name": "backup_1", "access_token": "...", "enabled": true}
-  ]
-}
+```bash
+cp dragonfly_accounts.example.json /secure/path/dragonfly_accounts.json
+chmod 600 /secure/path/dragonfly_accounts.json
 ```
 
 Подключение:
 
 ```bash
-DRAGONFLY_ACCOUNTS_FILE=/path/to/dragonfly_accounts.json
+DRAGONFLY_ACCOUNTS_FILE=/secure/path/dragonfly_accounts.json
 ```
 
 В multi-account режиме скрипт использует активный аккаунт из JSON. Если Dragonfly вернул `401`, скрипт переключает `active` на следующий enabled-аккаунт, отправляет alert в личку и повторяет запрос. При `429` аккаунты не переключаются: используется adaptive backoff, чтобы не забанить весь пул.
 
-Для приватного канала вместо `@dragonfly_flash` нужен numeric chat_id.
-Бот должен быть добавлен в канал админом с правом публикации.
+Для приватного канала вместо `@dragonfly_flash` нужен numeric chat_id. Бот должен быть добавлен в канал админом с правом публикации; для comments mirroring бот также должен быть в linked discussion group.
 
 ## Рекомендуемые безопасные параметры
 
@@ -128,11 +122,11 @@ python3 dragonfly_telegram_poster.py \
   --request-delay 2 \
   --send-delay 2 \
   --text-delay 2 \
-  --photo-delay 6 \
-  --album-delay 12 \
-  --animation-delay 45 \
-  --mixed-media-delay 45 \
-  --media-item-delay 12 \
+  --photo-delay 5 \
+  --album-delay 5 \
+  --animation-delay 5 \
+  --mixed-media-delay 5 \
+  --media-item-delay 2 \
   --poll-interval 15 \
   --max-attempts 3 \
   --keep-sent 50000 \
@@ -162,7 +156,7 @@ DRAGONFLY_ACCESS_TOKEN='...' \
 python3 dragonfly_telegram_poster.py --dry-run backfill --count 20
 ```
 
-## База состояния
+## База состояния и логи
 
 По умолчанию:
 
@@ -176,38 +170,33 @@ python3 dragonfly_telegram_poster.py --dry-run backfill --count 20
 ~/.hermes/logs/dragonfly_telegram_poster.log
 ```
 
-Лог ротируется автоматически: `10 MB × 5` backup-файлов, чтобы long-running watcher не раздувал один файл бесконечно.
+Лог ротируется автоматически: `10 MB × 5` backup-файлов.
 
-Можно указать другую:
+Можно указать другую базу:
 
 ```bash
 python3 dragonfly_telegram_poster.py \
-  --env-file dragonfly.env \
-  --db ./dragonfly.sqlite3 \
-  watch
+  --db /path/to/state.sqlite3 \
+  backfill --count 1000
 ```
 
-## Тесты
+## Канал «Лучшее»
+
+Посты, набравшие минимум 7 лайков, можно пересылать в отдельный канал:
 
 ```bash
-python3 test_dragonfly_telegram_poster.py
+TELEGRAM_BEST_CHAT_ID=-100xxxxxxxxxx
 ```
 
-## Мониторинг лайков/комментариев
+В текущей production-схеме отдельный `sync-best-watch` не нужен: `sync-stats` уже читает feed counters и сам пересылает qualifying posts в best channel с SQLite dedupe. Standalone `sync-best`/`sync-best-watch` оставлены для ручного backfill или изоляции.
 
-Скрипт умеет обновлять уже опубликованные Telegram-посты статистикой Dragonfly:
+## Stats footer
+
+Для уже опубликованных постов можно обновлять footer:
 
 ```text
-❤️ 12   💬 4
+❤️ N   💬 M
 ```
-
-Как это работает:
-
-- при отправке нового поста сохраняется mapping `Dragonfly post_id -> Telegram message_id`;
-- сохраняется базовый HTML первого сообщения/первой caption;
-- `sync-stats` берёт последние N постов из `/api/feed`, читает `likes_count` и `comments_count`;
-- если счётчики изменились — редактирует Telegram-сообщение через `editMessageText` или `editMessageCaption`;
-- старые посты без сохранённого `message_id` пропускаются.
 
 Один проход:
 
@@ -217,82 +206,27 @@ python3 dragonfly_telegram_poster.py \
   sync-stats --count 20
 ```
 
-Постоянный мониторинг раз в минуту:
+Постоянные watcher'ы:
 
 ```bash
-python3 dragonfly_telegram_poster.py \
-  --env-file /home/wacotal/dragonfly.env \
-  sync-stats-watch --count 20 --interval 60
-```
-
-Практичный production-профиль для снижения нагрузки: самые свежие 20 постов обновлять раз в 30 секунд, посты 21–50 — раз в минуту:
-
-```bash
+# last 20 — every 30s
 python3 dragonfly_telegram_poster.py \
   --env-file /home/wacotal/dragonfly.env \
   --dragonfly-account backup_1 \
+  --request-delay 2 \
   sync-stats-watch --count 20 --offset 0 --interval 30
 
+# posts 21–50 — every 60s
 python3 dragonfly_telegram_poster.py \
   --env-file /home/wacotal/dragonfly.env \
   --dragonfly-account backup_1 \
+  --request-delay 2 \
   sync-stats-watch --count 30 --offset 20 --interval 60
 ```
 
-Когда comments watcher отправляет новые комментарии, он сразу запускает обновление stats-footer для этого поста, чтобы `💬` не ждал более медленного минутного окна.
+Stats редактируются только на `role=main`. Для `💬` используется максимум из feed `comments_count` и числа уже зеркалированных Telegram comments, чтобы Telegram footer не показывал меньше, чем реально отправлено в discussion.
 
-Для read-only распределения нагрузки можно закрепить watcher за отдельным аккаунтом из `DRAGONFLY_ACCOUNTS_FILE`, не меняя глобальный `active`:
-
-```bash
-python3 dragonfly_telegram_poster.py \
-  --env-file /home/wacotal/dragonfly.env \
-  --dragonfly-account backup_1 \
-  sync-stats-watch --count 20 --offset 0 --interval 30
-
-python3 dragonfly_telegram_poster.py \
-  --env-file /home/wacotal/dragonfly.env \
-  --dragonfly-account backup_1 \
-  sync-stats-watch --count 30 --offset 20 --interval 60
-```
-
-`sync-stats` также проверяет порог «Лучшего», если задан `TELEGRAM_BEST_CHAT_ID`, поэтому отдельный `sync-best-watch` не обязателен.
-
-`--offset` позволяет шардировать окна между несколькими read-only watcher'ами без пересечения.
-
-## Канал «Лучшее»
-
-Посты, которые набрали лайки выше порога, можно пересылать в отдельный канал:
-
-```env
-TELEGRAM_BEST_CHAT_ID=-100xxxxxxxxxx
-```
-
-Один проход:
-
-```bash
-python3 dragonfly_telegram_poster.py \
-  --env-file /home/wacotal/dragonfly.env \
-  sync-best --count 50 --threshold 7
-```
-
-Постоянный watcher:
-
-```bash
-python3 dragonfly_telegram_poster.py \
-  --env-file /home/wacotal/dragonfly.env \
-  --dragonfly-account backup_1 \
-  sync-best-watch --count 50 --interval 30 --threshold 7
-```
-
-Скрипт использует SQLite-таблицу `best_posts` для dedupe: один Dragonfly `post_id` не пересылается повторно, даже если лайки потом колебались. Для split-постов пересылаются сохранённые `main` и `last` Telegram-сообщения; для обычных постов это одно сообщение.
-
-## Telegram discussion group
-
-Если канал привязан к группе обсуждений, укажите её ID:
-
-```env
-TELEGRAM_DISCUSSION_CHAT_ID=-100xxxxxxxxxx
-```
+## Discussion group / comments
 
 После отправки нового поста скрипт пробует через `getUpdates` найти автоматический forward Telegram в discussion group и сохраняет mapping:
 
@@ -308,13 +242,11 @@ python3 dragonfly_telegram_poster.py \
   repair-discussion-mapping --count 200 --wait-seconds 0 --update-timeout 0
 ```
 
-Это полезно после временных `getUpdates` timeout'ов. Команда ищет `telegram_messages.role='last'` без строки в `telegram_discussion_messages`, один раз читает доступный `getUpdates` snapshot и сопоставляет все missing rows внутри него. Для production repair держите `--update-timeout 0`, чтобы проход по сотням missing rows не зависал на long polling.
-
-Это подготовка для зеркалирования комментариев: если Dragonfly-пост разбит на несколько Telegram-сообщений, комментарии нужно отправлять reply именно к `role=last`.
+Команда ищет `telegram_messages.role='last'` без строки в `telegram_discussion_messages`, один раз читает доступный `getUpdates` snapshot и сопоставляет все missing rows внутри него. Старые missing mappings могут быть уже недоступны, если Telegram updates offset ушёл вперёд.
 
 ## Зеркалирование комментариев Dragonfly
 
-Комментарии берутся из endpoint:
+Endpoint:
 
 ```text
 /api/get_comments/<post_id>?user_id=<DRAGONFLY_USER_ID>
@@ -322,23 +254,7 @@ python3 dragonfly_telegram_poster.py \
 
 Первый проход по посту по умолчанию только помечает уже существующие комментарии как увиденные, чтобы не заспамить чат старыми комментариями. Новые комментарии после этого отправляются в discussion group ответом на `role=last`.
 
-Один проход:
-
-```bash
-python3 dragonfly_telegram_poster.py \
-  --env-file /home/wacotal/dragonfly.env \
-  sync-comments --count 20
-```
-
-Постоянный watcher:
-
-```bash
-python3 dragonfly_telegram_poster.py \
-  --env-file /home/wacotal/dragonfly.env \
-  sync-comments-watch --count 20 --interval 30 --hot-count 20
-```
-
-Для отдельного read-only аккаунта и расширенного окна:
+Постоянная production-схема на 50 постов:
 
 ```bash
 python3 dragonfly_telegram_poster.py \
@@ -357,9 +273,71 @@ python3 dragonfly_telegram_poster.py \
   sync-comments-watch --count 16 --offset 34 --interval 30 --send-existing --hot-count 20
 ```
 
-Comments watcher использует gating: для постов вне `--hot-count` он не ходит в `/api/get_comments/<post_id>`, если feed `comments_count` не вырос и нет ранее seeded комментариев без Telegram `message_id`. Перед отправкой каждый comment атомарно резервируется в SQLite, поэтому при overlap/shard-сдвигах только один процесс имеет право отправить конкретный `(post_id, comment_id)`. Если новый комментарий всё-таки отправлен, watcher сразу обновляет stats footer этого поста, чтобы `💬` совпадал с discussion.
+Comments watcher использует gating: для постов вне `--hot-count` он не ходит в `/api/get_comments/<post_id>`, если feed `comments_count` не вырос и нет ранее seeded комментариев без Telegram `message_id`. Перед отправкой каждый comment атомарно резервируется в SQLite, поэтому при overlap/shard-сдвигах только один процесс имеет право отправить конкретный `(post_id, comment_id)`. Если новый комментарий отправлен, watcher сразу обновляет stats footer этого поста, чтобы `💬` совпадал с discussion.
 
-Если нужно отправить уже существующие комментарии тоже, добавьте `--send-existing`.
+## Production systemd / перенос на другой сервер
+
+В репозитории есть переносимые шаблоны user-systemd unit'ов:
+
+```text
+deploy/systemd/user/dragonfly-bridge.target
+deploy/systemd/user/dragonfly-watch.service
+deploy/systemd/user/dragonfly-stats-hot.service
+deploy/systemd/user/dragonfly-stats-cold.service
+deploy/systemd/user/dragonfly-comments-0.service
+deploy/systemd/user/dragonfly-comments-17.service
+deploy/systemd/user/dragonfly-comments-34.service
+```
+
+Они не содержат локальных путей. На сервере их рендерит installer:
+
+```bash
+python3 scripts/install_systemd_user.py \
+  --project-dir "$PWD" \
+  --env-file "$HOME/dragonfly.env"
+```
+
+Проверить, что unit'ы появились:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user list-unit-files 'dragonfly-*'
+```
+
+Запустить весь bridge:
+
+```bash
+systemctl --user start dragonfly-bridge.target
+systemctl --user status dragonfly-bridge.target
+```
+
+Включить автозапуск при user login:
+
+```bash
+systemctl --user enable dragonfly-bridge.target
+```
+
+Чтобы user services переживали logout/reboot, на сервере обычно нужно один раз от root:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+### Минимальный migration checklist
+
+```bash
+git clone git@github.com:kochkinao/dragonfly_flash.git
+cd dragonfly_flash
+python3 -m py_compile dragonfly_telegram_poster.py
+cp dragonfly.env.example ~/dragonfly.env
+cp dragonfly_accounts.example.json ~/.dragonfly_accounts.json
+chmod 600 ~/dragonfly.env ~/.dragonfly_accounts.json
+# заполнить реальные Telegram/Dragonfly значения в ~/dragonfly.env и ~/.dragonfly_accounts.json
+python3 dragonfly_telegram_poster.py --env-file ~/dragonfly.env auth-check
+python3 scripts/install_systemd_user.py --project-dir "$PWD" --env-file ~/dragonfly.env --enable --start
+```
+
+Не переносите в Git реальные `.env`, cookie jar, SQLite state, логи, токены или SSH keys.
 
 ## Загрузка треков в Dragonfly
 
@@ -399,6 +377,6 @@ python3 dragonfly_audio_uploader.py \
 python3 dragonfly_audio_uploader.py \
   --env-file /home/wacotal/dragonfly.env \
   --artist "Artist" \
-  --title "Track title" \
+  --title "Title" \
   ./track.mp3
 ```

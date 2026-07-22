@@ -1,0 +1,30 @@
+{
+  "active": "main",
+  "accounts": [
+    {
+      "name": "main",
+      "access_token": "PASTE_MAIN_DRAGONFLY_JWT_HERE",
+      "enabled": true
+    },
+    {
+      "name": "backup_1",
+      "access_token": "PASTE_BACKUP_1_DRAGONFLY_JWT_HERE",
+      "enabled": true
+    },
+    {
+      "name": "backup_2",
+      "access_token": "PASTE_BACKUP_2_DRAGONFLY_JWT_HERE",
+      "enabled": true
+    },
+    {
+      "name": "backup_3",
+      "access_token": "PASTE_BACKUP_3_DRAGONFLY_JWT_HERE",
+      "enabled": true
+    },
+    {
+      "name": "backup_4",
+      "access_token": "PASTE_BACKUP_4_DRAGONFLY_JWT_HERE",
+      "enabled": true
+    }
+  ]
+}

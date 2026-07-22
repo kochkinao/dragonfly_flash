@@ -1,0 +1,23 @@
+[Unit]
+Description=Dragonfly Flash stats cold window + best forwarding
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{PROJECT_DIR}}
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile={{ENV_FILE}}
+ExecStart=/usr/bin/python3 {{PROJECT_DIR}}/dragonfly_telegram_poster.py \
+  --env-file {{ENV_FILE}} \
+  --dragonfly-account backup_1 \
+  --request-delay 2 \
+  --poll-interval 15 \
+  sync-stats-watch --count 30 --offset 20 --interval 60
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=dragonfly-bridge.target

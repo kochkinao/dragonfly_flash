@@ -1,0 +1,31 @@
+[Unit]
+Description=Dragonfly Flash -> Telegram publisher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{PROJECT_DIR}}
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile={{ENV_FILE}}
+ExecStart=/usr/bin/python3 {{PROJECT_DIR}}/dragonfly_telegram_poster.py \
+  --env-file {{ENV_FILE}} \
+  --request-delay 2 \
+  --send-delay 2 \
+  --text-delay 2 \
+  --photo-delay 5 \
+  --album-delay 5 \
+  --animation-delay 5 \
+  --mixed-media-delay 5 \
+  --media-item-delay 2 \
+  --poll-interval 15 \
+  --max-attempts 3 \
+  --keep-sent 50000 \
+  watch --max-gap-scan 200
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=dragonfly-bridge.target
