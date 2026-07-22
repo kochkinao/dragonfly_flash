@@ -826,6 +826,39 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(payloads[0]['timeout'], 0)
 
+    def test_repair_discussion_mapping_uses_one_updates_snapshot_for_many_rows(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        c.telegram_token = 'tg'
+        c.discussion_chat_id = '-100222'
+        for pid, mid in [(911, 601), (912, 602)]:
+            poster.record_telegram_message(
+                con,
+                post(post_id=pid),
+                chat_id='@channel',
+                message_id=mid,
+                message_kind='text',
+                base_html='base',
+                role='last',
+            )
+        calls = []
+        updates = [
+            {'update_id': 20, 'message': {'message_id': 801, 'chat': {'id': -100222}, 'is_automatic_forward': True, 'forward_from_message_id': 601}},
+            {'update_id': 21, 'message': {'message_id': 802, 'chat': {'id': -100222}, 'is_automatic_forward': True, 'forward_from_message_id': 602}},
+        ]
+        orig = poster.tg_request
+        poster.tg_request = lambda cfg, method, payload: calls.append((method, payload)) or {'ok': True, 'result': updates}
+        try:
+            rc = poster.cmd_repair_discussion_mapping(c, con, type('Args', (), {'count': 10, 'wait_seconds': 0, 'update_timeout': 0})())
+        finally:
+            poster.tg_request = orig
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)
+        rows = con.execute("SELECT post_id, discussion_message_id FROM telegram_discussion_messages ORDER BY post_id").fetchall()
+        self.assertEqual(rows, [(911, 801), (912, 802)])
+
     def test_sync_comments_seeds_existing_then_sends_new_comment(self):
         con = poster.init_db(Path(':memory:'))
         c = cfg()

@@ -2294,18 +2294,38 @@ def cmd_repair_discussion_mapping(cfg: Config, con: sqlite3.Connection, args: ar
         raise SystemExit("Set TELEGRAM_DISCUSSION_CHAT_ID or --discussion-chat-id")
     rows = missing_discussion_mappings(con, count=int(args.count), role="last")
     repaired = 0
-    for row in rows:
-        did = try_capture_discussion_mapping(
-            cfg,
-            con,
-            post_id=int(row["post_id"]),
-            role=str(row["role"]),
-            channel_message_id=int(row["message_id"]),
-            wait_seconds=float(getattr(args, "wait_seconds", 0)),
-            update_timeout=int(getattr(args, "update_timeout", 0)),
-        )
-        if did is not None:
-            repaired += 1
+    try:
+        updates = tg_get_updates(cfg, con, timeout=int(getattr(args, "update_timeout", 0)))
+    except Exception as e:
+        log(f"repair-discussion-mapping getUpdates failed: {e}", logging.WARNING)
+        log(f"repair-discussion-mapping done checked={len(rows)} repaired=0")
+        return 0
+    pending = {int(row["message_id"]): row for row in rows}
+    for upd in updates:
+        msg = upd.get("message") or upd.get("channel_post") or {}
+        if not isinstance(msg, dict):
+            continue
+        did = msg.get("message_id")
+        if not isinstance(did, int):
+            continue
+        for channel_message_id, row in list(pending.items()):
+            if _discussion_message_matches(msg, str(cfg.discussion_chat_id), int(channel_message_id)):
+                save_discussion_message(
+                    con,
+                    post_id=int(row["post_id"]),
+                    role=str(row["role"]),
+                    channel_chat_id=str(row["chat_id"]),
+                    channel_message_id=int(channel_message_id),
+                    discussion_chat_id=str(cfg.discussion_chat_id),
+                    discussion_message_id=int(did),
+                )
+                log(
+                    f"discussion mapping repaired post #{int(row['post_id'])} role={row['role']} "
+                    f"channel_message_id={channel_message_id} discussion_message_id={did}"
+                )
+                repaired += 1
+                pending.pop(channel_message_id, None)
+                break
     log(f"repair-discussion-mapping done checked={len(rows)} repaired={repaired}")
     return 0
 

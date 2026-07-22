@@ -298,7 +298,7 @@ python3 dragonfly_telegram_poster.py \
   repair-discussion-mapping --count 200 --wait-seconds 0 --update-timeout 0
 ```
 
-Это полезно после временных `getUpdates` timeout'ов. Команда ищет `telegram_messages.role='last'` без строки в `telegram_discussion_messages` и пробует сопоставить их с доступными Telegram updates. Для production repair держите `--update-timeout 0`, чтобы проход по сотням missing rows не зависал на long polling; если нужно подождать новые automatic forwards, временно остановите другой `getUpdates` consumer и задайте `--wait-seconds`/`--update-timeout` явно.
+Это полезно после временных `getUpdates` timeout'ов. Команда ищет `telegram_messages.role='last'` без строки в `telegram_discussion_messages`, один раз читает доступный `getUpdates` snapshot и сопоставляет все missing rows внутри него. Для production repair держите `--update-timeout 0`, чтобы проход по сотням missing rows не зависал на long polling.
 
 Это подготовка для зеркалирования комментариев: если Dragonfly-пост разбит на несколько Telegram-сообщений, комментарии нужно отправлять reply именно к `role=last`.
 
