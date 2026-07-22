@@ -1290,11 +1290,18 @@ def process_pending_admin_updates(cfg: Config, con: sqlite3.Connection) -> int:
     if not cfg.telegram_admin_user_id:
         return 0
     updates = read_cached_telegram_updates_since(con, offset_key="telegram_admin_updates_offset", limit=500)
-    handled = process_admin_updates(cfg, con, updates)
+    handled = 0
     max_update_id: int | None = None
     for update in updates:
-        if isinstance(update.get("update_id"), int):
-            max_update_id = max(max_update_id or 0, int(update["update_id"]))
+        update_id = update.get("update_id")
+        if isinstance(update_id, int):
+            max_update_id = max(max_update_id or 0, int(update_id))
+        try:
+            if process_admin_update(cfg, con, update):
+                handled += 1
+        except Exception as e:
+            log_exception(f"admin update #{update_id} failed", e)
+            continue
     if max_update_id is not None:
         kv_set(con, "telegram_admin_updates_offset", str(max_update_id + 1))
     return handled

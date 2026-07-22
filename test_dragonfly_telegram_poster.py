@@ -270,6 +270,32 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertIn('reply_markup', calls[0][1])
         self.assertEqual(poster.kv_get(con, 'telegram_admin_updates_offset'), '43')
 
+    def test_pending_admin_updates_skip_broken_update_and_continue(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.telegram_token = 'tg'
+        c.telegram_admin_user_id = '498975827'
+        updates = [
+            {'update_id': 50, 'message': {'message_id': 1, 'chat': {'id': 222}, 'from': {'id': 498975827}, 'text': '/status'}},
+            {'update_id': 51, 'message': {'message_id': 2, 'chat': {'id': 222}, 'from': {'id': 498975827}, 'text': '/panel'}},
+        ]
+        poster.store_telegram_updates(con, updates)
+        calls = []
+        orig = poster.tg_request
+        def flaky_tg_request(_cfg, method, payload):
+            calls.append((method, payload))
+            if method == 'sendMessage' and len([m for m, _p in calls if m == 'sendMessage']) == 1:
+                raise RuntimeError('stale update failed')
+            return {'ok': True, 'result': {'message_id': 1}}
+        poster.tg_request = flaky_tg_request
+        try:
+            handled = poster.process_pending_admin_updates(c, con)
+        finally:
+            poster.tg_request = orig
+        self.assertEqual(handled, 1)
+        self.assertEqual(poster.kv_get(con, 'telegram_admin_updates_offset'), '52')
+        self.assertTrue(any(method == 'sendMessage' and 'reply_markup' in payload for method, payload in calls))
+
     def test_runtime_settings_apply_to_config_without_restart(self):
         con = poster.init_db(Path(':memory:'))
         c = cfg()
