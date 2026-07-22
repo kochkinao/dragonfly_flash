@@ -77,6 +77,80 @@ class CaptureTelegram:
 
 
 class DragonflyPosterTests(unittest.TestCase):
+    def test_feed_cache_stores_and_reads_posts_by_offset_window(self):
+        con = poster.init_db(Path(':memory:'))
+        posts = [post(post_id=100 - i, description=f'post {i}') for i in range(5)]
+
+        poster.upsert_feed_cache(con, feed_type='all', offset=20, posts=posts)
+        cached = poster.read_feed_cache(con, feed_type='all', count=3, offset=21)
+
+        self.assertEqual([p['post_id'] for p in cached], [99, 98, 97])
+        self.assertEqual(cached[0]['description'], 'post 1')
+
+    def test_cmd_refresh_feed_cache_fetches_and_stores_requested_window(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.limit = 2
+        calls = []
+        orig_fetch_page = poster.fetch_feed_page
+        def fake_fetch_page(cfg, offset):
+            calls.append(offset)
+            return [post(post_id=1000 - offset - i) for i in range(2)]
+        poster.fetch_feed_page = fake_fetch_page
+        try:
+            rc = poster.cmd_refresh_feed_cache(c, con, poster.argparse.Namespace(count=5, offset=10))
+        finally:
+            poster.fetch_feed_page = orig_fetch_page
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [10, 12, 14])
+        cached = poster.read_feed_cache(con, feed_type='all', count=5, offset=10)
+        self.assertEqual([p['post_id'] for p in cached], [990, 989, 988, 987, 986])
+
+    def test_sync_stats_can_use_feed_cache_without_fetching_network_feed(self):
+        con = poster.init_db(Path(':memory:'))
+        cached_posts = [post(post_id=700), post(post_id=699)]
+        poster.upsert_feed_cache(con, feed_type='all', offset=0, posts=cached_posts)
+        c = cfg()
+        synced = []
+        orig_fetch = poster.fetch_recent_posts
+        orig_sync_stats = poster.sync_post_stats
+        orig_sync_best = poster.sync_best_post
+        poster.fetch_recent_posts = lambda *a, **k: (_ for _ in ()).throw(AssertionError('network feed should not be fetched'))
+        poster.sync_post_stats = lambda cfg, con, p: synced.append(p['post_id']) or True
+        poster.sync_best_post = lambda *a, **k: None
+        try:
+            rc = poster.cmd_sync_stats(c, con, poster.argparse.Namespace(count=2, offset=0, use_feed_cache=True))
+        finally:
+            poster.fetch_recent_posts = orig_fetch
+            poster.sync_post_stats = orig_sync_stats
+            poster.sync_best_post = orig_sync_best
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(synced, [700, 699])
+
+    def test_sync_comments_can_use_feed_cache_without_fetching_network_feed(self):
+        con = poster.init_db(Path(':memory:'))
+        cached_posts = [post(post_id=800, comments_count=1)]
+        poster.upsert_feed_cache(con, feed_type='all', offset=17, posts=cached_posts)
+        c = cfg()
+        called = []
+        orig_fetch = poster.fetch_recent_posts
+        orig_should = poster.should_fetch_post_comments
+        orig_sync_comments = poster.sync_post_comments
+        poster.fetch_recent_posts = lambda *a, **k: (_ for _ in ()).throw(AssertionError('network feed should not be fetched'))
+        poster.should_fetch_post_comments = lambda *a, **k: True
+        poster.sync_post_comments = lambda cfg, con, p, send_existing=False: called.append((p['post_id'], send_existing)) or (0, 0)
+        try:
+            rc = poster.cmd_sync_comments(c, con, poster.argparse.Namespace(count=1, offset=17, hot_count=20, send_existing=False, use_feed_cache=True))
+        finally:
+            poster.fetch_recent_posts = orig_fetch
+            poster.should_fetch_post_comments = orig_should
+            poster.sync_post_comments = orig_sync_comments
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(called, [(800, False)])
+
     def test_export_and_import_state_archive_roundtrip(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

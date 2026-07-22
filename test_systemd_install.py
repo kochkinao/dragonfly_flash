@@ -25,6 +25,7 @@ class SystemdInstallTests(unittest.TestCase):
 
         self.assertEqual(names, {
             'dragonfly-bridge.target',
+            'dragonfly-feed-cache.service',
             'dragonfly-watch.service',
             'dragonfly-stats-hot.service',
             'dragonfly-stats-cold.service',
@@ -37,8 +38,9 @@ class SystemdInstallTests(unittest.TestCase):
         self.assertNotIn('/home/wacotal', rendered)
         self.assertIn('Restart=always', rendered)
         self.assertIn('dragonfly-bridge.target', rendered)
-        self.assertIn('sync-stats-watch --count 20 --offset 0 --interval 30', rendered)
-        self.assertIn('sync-comments-watch --count 16 --offset 34 --interval 30 --send-existing --hot-count 20', rendered)
+        self.assertIn('refresh-feed-cache-watch --count 60 --offset 0 --interval 20', rendered)
+        self.assertIn('sync-stats-watch --count 20 --offset 0 --interval 30 --use-feed-cache', rendered)
+        self.assertIn('sync-comments-watch --count 16 --offset 34 --interval 30 --send-existing --hot-count 20 --use-feed-cache', rendered)
 
 
 if __name__ == '__main__':

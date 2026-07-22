@@ -65,6 +65,7 @@ DEFAULT_API_429_MAX_SLEEP = 900.0
 COMMENT_SEND_RESERVED_MESSAGE_ID = -1
 DOCTOR_EXPECTED_SYSTEMD_UNITS = {
     "dragonfly-bridge.target",
+    "dragonfly-feed-cache.service",
     "dragonfly-watch.service",
     "dragonfly-stats-hot.service",
     "dragonfly-stats-cold.service",
@@ -445,8 +446,56 @@ def init_db(path: Path) -> sqlite3.Connection:
     }.items():
         if name not in cols_tm:
             con.execute(ddl)
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cached_feed_posts (
+            feed_type TEXT NOT NULL,
+            feed_offset INTEGER NOT NULL,
+            post_id INTEGER NOT NULL,
+            payload_json TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            PRIMARY KEY(feed_type, feed_offset)
+        )
+        """
+    )
+    con.execute("CREATE INDEX IF NOT EXISTS idx_cached_feed_posts_post_id ON cached_feed_posts(post_id)")
     con.commit()
     return con
+
+
+def upsert_feed_cache(con: sqlite3.Connection, *, feed_type: str, offset: int, posts: list[dict[str, Any]]) -> int:
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    rows = [
+        (feed_type, int(offset) + i, int(p.get("post_id") or 0), json.dumps(p, ensure_ascii=False), fetched_at)
+        for i, p in enumerate(posts)
+        if p.get("post_id") is not None
+    ]
+    con.executemany(
+        """
+        INSERT INTO cached_feed_posts(feed_type, feed_offset, post_id, payload_json, fetched_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(feed_type, feed_offset) DO UPDATE SET
+            post_id=excluded.post_id,
+            payload_json=excluded.payload_json,
+            fetched_at=excluded.fetched_at
+        """,
+        rows,
+    )
+    con.commit()
+    return len(rows)
+
+
+def read_feed_cache(con: sqlite3.Connection, *, feed_type: str, count: int, offset: int = 0) -> list[dict[str, Any]]:
+    rows = con.execute(
+        """
+        SELECT payload_json FROM cached_feed_posts
+        WHERE feed_type = ? AND feed_offset >= ?
+        ORDER BY feed_offset ASC
+        LIMIT ?
+        """,
+        (feed_type, int(offset), int(count)),
+    ).fetchall()
+    return [json.loads(row[0]) for row in rows]
 
 
 def _sqlite_snapshot(source: Path, target: Path) -> None:
@@ -2488,13 +2537,24 @@ def cmd_repair_discussion_mapping(cfg: Config, con: sqlite3.Connection, args: ar
     return 0
 
 
-def cmd_sync_comments(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
+def get_recent_posts_for_command(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> list[dict[str, Any]]:
+    count = int(args.count)
+    offset = int(getattr(args, "offset", 0))
+    if bool(getattr(args, "use_feed_cache", False)):
+        posts = read_feed_cache(con, feed_type=cfg.feed_type, count=count, offset=offset)
+        if len(posts) < count:
+            log(f"feed cache partial type={cfg.feed_type} offset={offset} requested={count} available={len(posts)}", logging.WARNING)
+        return posts
     old_limit = cfg.limit
-    cfg.limit = int(args.count)
+    cfg.limit = count
     try:
-        posts = fetch_recent_posts(cfg, int(args.count), start_offset=int(getattr(args, "offset", 0)))
+        return fetch_recent_posts(cfg, count, start_offset=offset)
     finally:
         cfg.limit = old_limit
+
+
+def cmd_sync_comments(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
+    posts = get_recent_posts_for_command(cfg, con, args)
     total_sent = 0
     total_marked = 0
     checked = 0
@@ -2533,6 +2593,31 @@ def cmd_sync_comments_watch(cfg: Config, con: sqlite3.Connection, args: argparse
         except Exception as e:
             log_exception("sync-comments-watch loop error", e)
             send_alert(cfg, "Ошибка sync-comments-watch", f"Зеркалирование комментариев не остановлено: попробую снова через {human_duration(args.interval)}. Причина: {str(e)[:500]}", level="error")
+        time.sleep(float(args.interval))
+
+
+def cmd_refresh_feed_cache(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
+    count = int(args.count)
+    offset = int(getattr(args, "offset", 0))
+    posts = fetch_recent_posts(cfg, count, start_offset=offset)
+    stored = upsert_feed_cache(con, feed_type=cfg.feed_type, offset=offset, posts=posts)
+    log(f"feed cache refreshed type={cfg.feed_type} offset={offset} requested={count} fetched={len(posts)} stored={stored}")
+    return 0
+
+
+def cmd_refresh_feed_cache_watch(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
+    log(f"feed-cache-watch started interval={args.interval}s count={args.count} offset={getattr(args, 'offset', 0)} account={cfg.account_name or 'default'} dry_run={cfg.dry_run}")
+    while True:
+        try:
+            cmd_refresh_feed_cache(cfg, con, args)
+        except Exception as e:
+            log_exception("feed-cache-watch loop error", e)
+            send_alert(
+                cfg,
+                "Ошибка feed-cache-watch",
+                f"Кэш feed не остановлен: подожду {human_duration(args.interval)} и попробую снова. Причина: {str(e)[:500]}",
+                level="error",
+            )
         time.sleep(float(args.interval))
 
 
@@ -2634,12 +2719,7 @@ def cmd_doctor(cfg: Config, con: sqlite3.Connection | None, args: argparse.Names
 
 
 def cmd_sync_stats(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
-    old_limit = cfg.limit
-    cfg.limit = int(args.count)
-    try:
-        posts = fetch_recent_posts(cfg, int(args.count), start_offset=int(getattr(args, "offset", 0)))
-    finally:
-        cfg.limit = old_limit
+    posts = get_recent_posts_for_command(cfg, con, args)
     updated = 0
     seen = 0
     for p in posts[: int(args.count)]:
@@ -2715,6 +2795,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("archive", help="archive created by export-state")
     s.add_argument("--db", default=str(DEFAULT_DB), help="target SQLite DB path")
     s.add_argument("--accounts-file", default=None, help="target Dragonfly accounts JSON path; omitted means restore DB only")
+    s = sub.add_parser("refresh-feed-cache", help="one-shot refresh of recent Dragonfly feed into SQLite cache")
+    s.add_argument("--count", type=int, default=50, help="recent Dragonfly posts to cache")
+    s.add_argument("--offset", type=int, default=0, help="Dragonfly feed offset")
+    s = sub.add_parser("refresh-feed-cache-watch", help="poll Dragonfly feed and keep SQLite cache warm")
+    s.add_argument("--count", type=int, default=50, help="recent Dragonfly posts to cache per tick")
+    s.add_argument("--offset", type=int, default=0, help="Dragonfly feed offset")
+    s.add_argument("--interval", type=float, default=30.0, help="seconds between cache refresh ticks")
 
     s = sub.add_parser("init", help="mark recent posts as seen without sending")
     s.add_argument("--count", type=int, default=20)
@@ -2733,11 +2820,13 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("sync-stats", help="one-shot sync of likes/comments for recent posts already mapped to Telegram")
     s.add_argument("--count", type=int, default=20, help="recent Dragonfly posts to inspect")
     s.add_argument("--offset", type=int, default=0, help="Dragonfly feed offset; useful for sharding read-only watchers")
+    s.add_argument("--use-feed-cache", action="store_true", help="read post window from SQLite feed cache instead of Dragonfly feed API")
 
     s = sub.add_parser("sync-stats-watch", help="poll likes/comments and edit Telegram posts forever")
     s.add_argument("--count", type=int, default=20, help="recent Dragonfly posts to inspect per tick")
     s.add_argument("--interval", type=float, default=60.0, help="seconds between stats sync ticks")
     s.add_argument("--offset", type=int, default=0, help="Dragonfly feed offset; useful for sharding read-only watchers")
+    s.add_argument("--use-feed-cache", action="store_true", help="read post window from SQLite feed cache instead of Dragonfly feed API")
 
     s = sub.add_parser("repair-discussion-mapping", help="retry mapping channel posts to Telegram discussion messages")
     s.add_argument("--count", type=int, default=200, help="missing role=last mappings to inspect")
@@ -2749,6 +2838,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--offset", type=int, default=0, help="Dragonfly feed offset; useful for sharding read-only watchers")
     s.add_argument("--send-existing", action="store_true", help="send already existing comments too; default seeds existing comments silently on first observation")
     s.add_argument("--hot-count", type=int, default=20, help="always fetch full comments for this many newest feed positions; older posts use comments_count gating")
+    s.add_argument("--use-feed-cache", action="store_true", help="read post window from SQLite feed cache instead of Dragonfly feed API")
 
     s = sub.add_parser("sync-comments-watch", help="poll Dragonfly comments and mirror new ones forever")
     s.add_argument("--count", type=int, default=20, help="recent Dragonfly posts to inspect per tick")
@@ -2756,6 +2846,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--offset", type=int, default=0, help="Dragonfly feed offset; useful for sharding read-only watchers")
     s.add_argument("--send-existing", action="store_true", help="send already existing comments too; default seeds existing comments silently on first observation")
     s.add_argument("--hot-count", type=int, default=20, help="always fetch full comments for this many newest feed positions; older posts use comments_count gating")
+    s.add_argument("--use-feed-cache", action="store_true", help="read post window from SQLite feed cache instead of Dragonfly feed API")
 
     s = sub.add_parser("sync-best", help="one-shot forward posts that reached the likes threshold to the best channel")
     s.add_argument("--count", type=int, default=50, help="recent Dragonfly posts to inspect")
@@ -2832,6 +2923,10 @@ def main() -> int:
         return cmd_sync_stats(cfg, con, args)
     if args.cmd == "sync-stats-watch":
         return cmd_sync_stats_watch(cfg, con, args)
+    if args.cmd == "refresh-feed-cache":
+        return cmd_refresh_feed_cache(cfg, con, args)
+    if args.cmd == "refresh-feed-cache-watch":
+        return cmd_refresh_feed_cache_watch(cfg, con, args)
     if args.cmd == "repair-discussion-mapping":
         return cmd_repair_discussion_mapping(cfg, con, args)
     if args.cmd == "sync-comments":

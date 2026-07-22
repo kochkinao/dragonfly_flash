@@ -12,7 +12,7 @@ ExecStart=/usr/bin/python3 {{PROJECT_DIR}}/dragonfly_telegram_poster.py \
   --env-file {{ENV_FILE}} \
   --dragonfly-account backup_4 \
   --request-delay 2 \
-  sync-comments-watch --count 16 --offset 34 --interval 30 --send-existing --hot-count 20
+  sync-comments-watch --count 16 --offset 34 --interval 30 --send-existing --hot-count 20 --use-feed-cache
 Restart=always
 RestartSec=10
 KillSignal=SIGTERM

@@ -206,23 +206,32 @@ python3 dragonfly_telegram_poster.py \
   sync-stats --count 20
 ```
 
-Постоянные watcher'ы:
+Постоянные watcher'ы через общий feed cache:
 
 ```bash
-# last 20 — every 30s
+# one Dragonfly feed reader for offsets 0–59
 python3 dragonfly_telegram_poster.py \
   --env-file /home/wacotal/dragonfly.env \
   --dragonfly-account backup_1 \
   --request-delay 2 \
-  sync-stats-watch --count 20 --offset 0 --interval 30
+  refresh-feed-cache-watch --count 60 --offset 0 --interval 20
 
-# posts 21–50 — every 60s
+# last 20 — every 30s, local SQLite feed cache
 python3 dragonfly_telegram_poster.py \
   --env-file /home/wacotal/dragonfly.env \
   --dragonfly-account backup_1 \
   --request-delay 2 \
-  sync-stats-watch --count 30 --offset 20 --interval 60
+  sync-stats-watch --count 20 --offset 0 --interval 30 --use-feed-cache
+
+# posts 21–50 — every 60s, local SQLite feed cache
+python3 dragonfly_telegram_poster.py \
+  --env-file /home/wacotal/dragonfly.env \
+  --dragonfly-account backup_1 \
+  --request-delay 2 \
+  sync-stats-watch --count 30 --offset 20 --interval 60 --use-feed-cache
 ```
+
+`refresh-feed-cache-watch` один ходит в `/api/feed` и складывает окно постов в SQLite `cached_feed_posts`. Stats/best watcher'ы с `--use-feed-cache` читают это окно локально и не создают отдельные feed-запросы.
 
 Stats редактируются только на `role=main`. Для `💬` используется максимум из feed `comments_count` и числа уже зеркалированных Telegram comments, чтобы Telegram footer не показывал меньше, чем реально отправлено в discussion.
 
@@ -254,23 +263,23 @@ Endpoint:
 
 Первый проход по посту по умолчанию только помечает уже существующие комментарии как увиденные, чтобы не заспамить чат старыми комментариями. Новые комментарии после этого отправляются в discussion group ответом на `role=last`.
 
-Постоянная production-схема на 50 постов:
+Постоянная production-схема на 50 постов через общий feed cache:
 
 ```bash
 python3 dragonfly_telegram_poster.py \
   --env-file /home/wacotal/dragonfly.env \
   --dragonfly-account backup_2 \
-  sync-comments-watch --count 17 --offset 0 --interval 30 --send-existing --hot-count 20
+  sync-comments-watch --count 17 --offset 0 --interval 30 --send-existing --hot-count 20 --use-feed-cache
 
 python3 dragonfly_telegram_poster.py \
   --env-file /home/wacotal/dragonfly.env \
   --dragonfly-account backup_3 \
-  sync-comments-watch --count 17 --offset 17 --interval 30 --send-existing --hot-count 20
+  sync-comments-watch --count 17 --offset 17 --interval 30 --send-existing --hot-count 20 --use-feed-cache
 
 python3 dragonfly_telegram_poster.py \
   --env-file /home/wacotal/dragonfly.env \
   --dragonfly-account backup_4 \
-  sync-comments-watch --count 16 --offset 34 --interval 30 --send-existing --hot-count 20
+  sync-comments-watch --count 16 --offset 34 --interval 30 --send-existing --hot-count 20 --use-feed-cache
 ```
 
 Comments watcher использует gating: для постов вне `--hot-count` он не ходит в `/api/get_comments/<post_id>`, если feed `comments_count` не вырос и нет ранее seeded комментариев без Telegram `message_id`. Перед отправкой каждый comment атомарно резервируется в SQLite, поэтому при overlap/shard-сдвигах только один процесс имеет право отправить конкретный `(post_id, comment_id)`. Если новый комментарий отправлен, watcher сразу обновляет stats footer этого поста, чтобы `💬` совпадал с discussion.
@@ -281,6 +290,7 @@ Comments watcher использует gating: для постов вне `--hot-
 
 ```text
 deploy/systemd/user/dragonfly-bridge.target
+deploy/systemd/user/dragonfly-feed-cache.service
 deploy/systemd/user/dragonfly-watch.service
 deploy/systemd/user/dragonfly-stats-hot.service
 deploy/systemd/user/dragonfly-stats-cold.service
