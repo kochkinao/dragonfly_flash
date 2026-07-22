@@ -924,6 +924,19 @@ RUNTIME_INT_SETTINGS = {
     "stats_cold_count",
     "comments_hot_count",
 }
+RUNTIME_SETTING_META = {
+    "request_delay": ("🌐 API-задержка", 1.0, 0.0),
+    "send_delay": ("📨 Telegram send", 1.0, 0.0),
+    "text_delay": ("📝 Текст", 1.0, 0.0),
+    "photo_delay": ("🖼 Фото/GIF/video", 1.0, 0.0),
+    "album_delay": ("🖼 Альбом", 1.0, 0.0),
+    "media_item_delay": ("📎 Media item", 1.0, 0.0),
+    "poll_interval": ("🔎 Новые посты", 5.0, 5.0),
+    "feed_cache_interval": ("🧊 Feed cache", 5.0, 5.0),
+    "stats_hot_interval": ("❤️ Stats hot", 5.0, 10.0),
+    "stats_cold_interval": ("💤 Stats cold", 10.0, 20.0),
+    "comments_interval": ("💬 Комменты", 5.0, 10.0),
+}
 RUNTIME_SETTINGS = RUNTIME_FLOAT_SETTINGS | RUNTIME_INT_SETTINGS
 
 
@@ -960,7 +973,137 @@ def admin_reply(cfg: Config, chat_id: int | str, text: str) -> None:
     tg_request(cfg, "sendMessage", {"chat_id": chat_id, "text": text[:MAX_TG_MESSAGE]})
 
 
+def runtime_setting_display(con: sqlite3.Connection, name: str) -> str:
+    val = kv_get(con, runtime_setting_key(name))
+    return val if val is not None else "default"
+
+
+def build_admin_panel(con: sqlite3.Connection) -> tuple[str, dict[str, Any]]:
+    text = (
+        "🛠 Панель Dragonfly\n\n"
+        "Нажимай − / +, чтобы менять задержки без команд.\n"
+        "Изменения сохраняются сразу и применяются на следующем цикле."
+    )
+    rows: list[list[dict[str, str]]] = []
+    for name in (
+        "request_delay",
+        "send_delay",
+        "text_delay",
+        "photo_delay",
+        "album_delay",
+        "media_item_delay",
+        "poll_interval",
+        "feed_cache_interval",
+        "stats_hot_interval",
+        "stats_cold_interval",
+        "comments_interval",
+    ):
+        label, _, _ = RUNTIME_SETTING_META.get(name, (name, 1.0, 0.0))
+        rows.append([
+            {"text": "−", "callback_data": f"admin:dec:{name}"},
+            {"text": f"{label}: {runtime_setting_display(con, name)}s", "callback_data": f"admin:noop:{name}"},
+            {"text": "+", "callback_data": f"admin:inc:{name}"},
+        ])
+    rows.append([
+        {"text": "⚡ Быстро", "callback_data": "admin:preset:fast"},
+        {"text": "🛡 Норма", "callback_data": "admin:preset:normal"},
+        {"text": "🐢 Бережно", "callback_data": "admin:preset:safe"},
+    ])
+    rows.append([
+        {"text": "🔄 Обновить", "callback_data": "admin:panel"},
+        {"text": "📊 Статус", "callback_data": "admin:status"},
+    ])
+    return text, {"inline_keyboard": rows}
+
+
+def send_admin_panel(cfg: Config, con: sqlite3.Connection, chat_id: int | str) -> None:
+    text, markup = build_admin_panel(con)
+    tg_request(cfg, "sendMessage", {"chat_id": chat_id, "text": text, "reply_markup": markup})
+
+
+def edit_admin_panel(cfg: Config, con: sqlite3.Connection, chat_id: int | str, message_id: int, note: str | None = None) -> None:
+    text, markup = build_admin_panel(con)
+    if note:
+        text = f"{note}\n\n{text}"
+    tg_request(cfg, "editMessageText", {"chat_id": chat_id, "message_id": message_id, "text": text, "reply_markup": markup})
+
+
+def admin_status_text(con: sqlite3.Connection) -> str:
+    lines = ["📊 Dragonfly settings"]
+    for name in sorted(RUNTIME_SETTING_META):
+        label, _, _ = RUNTIME_SETTING_META[name]
+        lines.append(f"{label}: {runtime_setting_display(con, name)}s")
+    return "\n".join(lines)
+
+
+def set_admin_preset(con: sqlite3.Connection, preset: str) -> None:
+    presets = {
+        "fast": {
+            "request_delay": 1, "send_delay": 1, "text_delay": 1, "photo_delay": 3, "album_delay": 3,
+            "media_item_delay": 1, "poll_interval": 10, "feed_cache_interval": 15,
+            "stats_hot_interval": 20, "stats_cold_interval": 45, "comments_interval": 20,
+        },
+        "normal": {
+            "request_delay": 2, "send_delay": 2, "text_delay": 2, "photo_delay": 5, "album_delay": 5,
+            "media_item_delay": 2, "poll_interval": 15, "feed_cache_interval": 20,
+            "stats_hot_interval": 30, "stats_cold_interval": 60, "comments_interval": 30,
+        },
+        "safe": {
+            "request_delay": 4, "send_delay": 3, "text_delay": 3, "photo_delay": 8, "album_delay": 8,
+            "media_item_delay": 3, "poll_interval": 25, "feed_cache_interval": 40,
+            "stats_hot_interval": 60, "stats_cold_interval": 120, "comments_interval": 60,
+        },
+    }
+    for name, value in presets[preset].items():
+        set_runtime_setting(con, name, value)
+
+
+def process_admin_callback(cfg: Config, con: sqlite3.Connection, callback: dict[str, Any]) -> bool:
+    sender = callback.get("from") if isinstance(callback.get("from"), dict) else {}
+    admin_id = str(cfg.telegram_admin_user_id or "").strip()
+    if not admin_id or str(sender.get("id")) != admin_id:
+        tg_request(cfg, "answerCallbackQuery", {"callback_query_id": callback.get("id"), "text": "Нет доступа", "show_alert": False})
+        return False
+    data = str(callback.get("data") or "")
+    message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
+    chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+    chat_id = chat.get("id")
+    message_id = message.get("message_id")
+    parts = data.split(":")
+    if len(parts) < 2 or parts[0] != "admin":
+        return False
+    action = parts[1]
+    note = "✅ Готово"
+    if action in {"inc", "dec"} and len(parts) == 3:
+        name = parts[2]
+        label, step, min_value = RUNTIME_SETTING_META.get(name, (name, 1.0, 0.0))
+        current = float(get_runtime_setting(con, name, 2.0) or 0.0)
+        new_value = current + float(step) if action == "inc" else max(float(min_value), current - float(step))
+        value = set_runtime_setting(con, name, new_value)
+        note = f"✅ {label}: {value}s"
+    elif action == "preset" and len(parts) == 3 and parts[2] in {"fast", "normal", "safe"}:
+        set_admin_preset(con, parts[2])
+        note = {"fast": "⚡ Быстрый профиль включён", "normal": "🛡 Нормальный профиль включён", "safe": "🐢 Бережный профиль включён"}[parts[2]]
+    elif action == "status":
+        tg_request(cfg, "answerCallbackQuery", {"callback_query_id": callback.get("id"), "text": "Статус обновлён", "show_alert": False})
+        if chat_id is not None and message_id is not None:
+            tg_request(cfg, "editMessageText", {"chat_id": chat_id, "message_id": message_id, "text": admin_status_text(con), "reply_markup": build_admin_panel(con)[1]})
+        return True
+    elif action in {"panel", "noop"}:
+        note = None
+    else:
+        tg_request(cfg, "answerCallbackQuery", {"callback_query_id": callback.get("id"), "text": "Неизвестная кнопка", "show_alert": False})
+        return True
+    tg_request(cfg, "answerCallbackQuery", {"callback_query_id": callback.get("id"), "text": note or "OK", "show_alert": False})
+    if chat_id is not None and message_id is not None:
+        edit_admin_panel(cfg, con, chat_id, int(message_id), note=note)
+    return True
+
+
 def process_admin_update(cfg: Config, con: sqlite3.Connection, update: dict[str, Any]) -> bool:
+    callback = update.get("callback_query") if isinstance(update, dict) else None
+    if isinstance(callback, dict):
+        return process_admin_callback(cfg, con, callback)
     msg = update.get("message") if isinstance(update, dict) else None
     if not isinstance(msg, dict):
         return False
@@ -989,8 +1132,11 @@ def process_admin_update(cfg: Config, con: sqlite3.Connection, update: dict[str,
     if cmd == "/get" and len(parts) == 2:
         admin_reply(cfg, chat_id, f"{parts[1]} = {kv_get(con, runtime_setting_key(parts[1])) or 'default'}")
         return True
-    if cmd in {"/help", "/start"}:
-        admin_reply(cfg, chat_id, "Команды: /status, /set <setting> <value>, /get <setting>. Настройки: " + ", ".join(sorted(RUNTIME_SETTINGS)))
+    if cmd in {"/panel", "/start"}:
+        send_admin_panel(cfg, con, chat_id)
+        return True
+    if cmd in {"/help"}:
+        admin_reply(cfg, chat_id, "Команды: /panel, /status, /set <setting> <value>, /get <setting>. Настройки: " + ", ".join(sorted(RUNTIME_SETTING_META)))
         return True
     if cmd == "/status":
         lines = ["Dragonfly admin settings:"]
@@ -1041,7 +1187,7 @@ def runtime_interval(con: sqlite3.Connection, setting_name: str, default: float 
 def tg_get_updates(cfg: Config, con: sqlite3.Connection, *, timeout: int = 2) -> list[dict[str, Any]]:
     if cfg.dry_run or not cfg.telegram_token:
         return []
-    payload: dict[str, Any] = {"timeout": timeout, "allowed_updates": ["message", "channel_post"]}
+    payload: dict[str, Any] = {"timeout": timeout, "allowed_updates": ["message", "channel_post", "callback_query"]}
     offset_s = kv_get(con, "telegram_updates_offset")
     if offset_s:
         try:

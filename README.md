@@ -102,23 +102,37 @@ DRAGONFLY_ACCOUNTS_FILE=/secure/path/dragonfly_accounts.json
 Команды:
 
 ```text
+/panel
+/start
 /help
 /status
 /get request_delay
 /set request_delay 2
-/set send_delay 2
-/set text_delay 2
-/set photo_delay 5
-/set album_delay 5
-/set animation_delay 5
-/set mixed_media_delay 5
-/set media_item_delay 2
-/set poll_interval 15
-/set feed_cache_interval 20
-/set stats_hot_interval 30
-/set stats_cold_interval 60
-/set comments_interval 30
 ```
+
+Основной интерфейс — `/panel`: бот присылает inline-кнопки `−` / `+` по каждому параметру, кнопку обновления, статус и быстрые профили:
+
+- `⚡ Быстро` — минимальные задержки, когда Dragonfly/Telegram ведут себя стабильно;
+- `🛡 Норма` — стандартный production-профиль;
+- `🐢 Бережно` — меньше нагрузки и меньше риск 429/flood wait.
+
+Доступные настройки в панели:
+
+```text
+request_delay
+send_delay
+text_delay
+photo_delay
+album_delay
+media_item_delay
+poll_interval
+feed_cache_interval
+stats_hot_interval
+stats_cold_interval
+comments_interval
+```
+
+Ручные `/set` и `/get` оставлены как fallback, если кнопки недоступны.
 
 Настройки сохраняются в SQLite (`kv` keys `runtime_setting.*`) и применяются watcher'ами на следующем цикле без ручного рестарта. Используется общий Telegram `getUpdates` offset/cache, поэтому не запускайте второй независимый long-poller с тем же bot token.
 

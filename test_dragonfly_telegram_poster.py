@@ -173,6 +173,35 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertIn('нет доступа', calls[0][1]['text'].lower())
         self.assertIn('request_delay = 3.0', calls[1][1]['text'])
 
+    def test_admin_panel_sends_inline_keyboard_and_callback_changes_setting(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.telegram_token = 'tg'
+        c.telegram_admin_user_id = '498975827'
+        panel = {
+            'update_id': 3,
+            'message': {'message_id': 12, 'chat': {'id': 222}, 'from': {'id': 498975827}, 'text': '/panel'},
+        }
+        callback = {
+            'update_id': 4,
+            'callback_query': {
+                'id': 'cb1',
+                'from': {'id': 498975827},
+                'message': {'message_id': 12, 'chat': {'id': 222}},
+                'data': 'admin:inc:request_delay',
+            },
+        }
+        with CaptureTelegram() as calls:
+            self.assertTrue(poster.process_admin_update(c, con, panel))
+            self.assertTrue(poster.process_admin_update(c, con, callback))
+        self.assertEqual(calls[0][0], 'sendMessage')
+        self.assertIn('reply_markup', calls[0][1])
+        self.assertIn('inline_keyboard', calls[0][1]['reply_markup'])
+        self.assertEqual(poster.kv_get(con, 'runtime_setting.request_delay'), '3.0')
+        methods = [m for m, _ in calls]
+        self.assertIn('answerCallbackQuery', methods)
+        self.assertIn('editMessageText', methods)
+
     def test_runtime_settings_apply_to_config_without_restart(self):
         con = poster.init_db(Path(':memory:'))
         c = cfg()
