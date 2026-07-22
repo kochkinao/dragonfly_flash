@@ -151,6 +151,39 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(called, [(800, False)])
 
+    def test_admin_bot_set_rejects_unauthorized_and_accepts_admin(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.telegram_token = 'tg'
+        c.telegram_admin_user_id = '498975827'
+        unauthorized = {
+            'update_id': 1,
+            'message': {'message_id': 10, 'chat': {'id': 111}, 'from': {'id': 999}, 'text': '/set request_delay 3'},
+        }
+        authorized = {
+            'update_id': 2,
+            'message': {'message_id': 11, 'chat': {'id': 222}, 'from': {'id': 498975827}, 'text': '/set request_delay 3'},
+        }
+        with CaptureTelegram() as calls:
+            self.assertEqual(poster.process_admin_update(c, con, unauthorized), False)
+            self.assertIsNone(poster.kv_get(con, 'runtime_setting.request_delay'))
+            self.assertEqual(poster.process_admin_update(c, con, authorized), True)
+        self.assertEqual(poster.kv_get(con, 'runtime_setting.request_delay'), '3.0')
+        self.assertEqual(calls[0][0], 'sendMessage')
+        self.assertIn('нет доступа', calls[0][1]['text'].lower())
+        self.assertIn('request_delay = 3.0', calls[1][1]['text'])
+
+    def test_runtime_settings_apply_to_config_without_restart(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.request_delay = 1
+        c.poll_interval = 15
+        poster.set_runtime_setting(con, 'request_delay', '2.5')
+        poster.set_runtime_setting(con, 'poll_interval', '7')
+        poster.apply_runtime_settings(c, con)
+        self.assertEqual(c.request_delay, 2.5)
+        self.assertEqual(c.poll_interval, 7.0)
+
     def test_export_and_import_state_archive_roundtrip(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

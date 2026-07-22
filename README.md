@@ -45,6 +45,7 @@ DRAGONFLY_COOKIE_FILE=/path/to/dragonfly_cookies.txt
 TELEGRAM_BOT_TOKEN=***
 TELEGRAM_CHAT_ID=@dragonfly_flash
 TELEGRAM_ALERT_CHAT_ID=123456789
+TELEGRAM_ADMIN_USER_ID=123456789
 TELEGRAM_DISCUSSION_CHAT_ID=-100xxxxxxxxxx
 TELEGRAM_BEST_CHAT_ID=-100xxxxxxxxxx
 DRAGONFLY_USER_ID=2723
@@ -93,6 +94,33 @@ DRAGONFLY_ACCOUNTS_FILE=/secure/path/dragonfly_accounts.json
 В multi-account режиме скрипт использует активный аккаунт из JSON. Если Dragonfly вернул `401`, скрипт переключает `active` на следующий enabled-аккаунт, отправляет alert в личку и повторяет запрос. При `429` аккаунты не переключаются: используется adaptive backoff, чтобы не забанить весь пул.
 
 Для приватного канала вместо `@dragonfly_flash` нужен numeric chat_id. Бот должен быть добавлен в канал админом с правом публикации; для comments mirroring бот также должен быть в linked discussion group.
+
+### Telegram admin commands
+
+Если задан `TELEGRAM_ADMIN_USER_ID`, основной процесс `watch` принимает admin-команды в личке с тем же ботом, который публикует посты и комментарии. Доступ разрешён только Telegram `from.id`, равному `TELEGRAM_ADMIN_USER_ID`; остальные получают короткое `Нет доступа`. Секреты/env/token values команды не показывают.
+
+Команды:
+
+```text
+/help
+/status
+/get request_delay
+/set request_delay 2
+/set send_delay 2
+/set text_delay 2
+/set photo_delay 5
+/set album_delay 5
+/set animation_delay 5
+/set mixed_media_delay 5
+/set media_item_delay 2
+/set poll_interval 15
+/set feed_cache_interval 20
+/set stats_hot_interval 30
+/set stats_cold_interval 60
+/set comments_interval 30
+```
+
+Настройки сохраняются в SQLite (`kv` keys `runtime_setting.*`) и применяются watcher'ами на следующем цикле без ручного рестарта. Используется общий Telegram `getUpdates` offset/cache, поэтому не запускайте второй независимый long-poller с тем же bot token.
 
 ## Рекомендуемые безопасные параметры
 

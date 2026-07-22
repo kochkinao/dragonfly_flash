@@ -106,6 +106,7 @@ class Config:
     accounts_file: str | None = None
     account_name: str | None = None
     account_pinned: bool = False
+    telegram_admin_user_id: str | None = None
 
 
 LOGGER = logging.getLogger("dragonfly_telegram_poster")
@@ -459,6 +460,16 @@ def init_db(path: Path) -> sqlite3.Connection:
         """
     )
     con.execute("CREATE INDEX IF NOT EXISTS idx_cached_feed_posts_post_id ON cached_feed_posts(post_id)")
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS telegram_update_cache (
+            update_id INTEGER PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            received_at TEXT NOT NULL
+        )
+        """
+    )
+    con.execute("CREATE INDEX IF NOT EXISTS idx_telegram_update_cache_received_at ON telegram_update_cache(received_at)")
     con.commit()
     return con
 
@@ -892,6 +903,141 @@ def kv_set(con: sqlite3.Connection, key: str, value: str) -> None:
     con.commit()
 
 
+RUNTIME_FLOAT_SETTINGS = {
+    "request_delay",
+    "send_delay",
+    "text_delay",
+    "photo_delay",
+    "album_delay",
+    "animation_delay",
+    "mixed_media_delay",
+    "media_item_delay",
+    "poll_interval",
+    "feed_cache_interval",
+    "stats_hot_interval",
+    "stats_cold_interval",
+    "comments_interval",
+}
+RUNTIME_INT_SETTINGS = {
+    "feed_cache_count",
+    "stats_hot_count",
+    "stats_cold_count",
+    "comments_hot_count",
+}
+RUNTIME_SETTINGS = RUNTIME_FLOAT_SETTINGS | RUNTIME_INT_SETTINGS
+
+
+def runtime_setting_key(name: str) -> str:
+    return f"runtime_setting.{name}"
+
+
+def get_runtime_setting(con: sqlite3.Connection, name: str, default: float | int | None = None) -> float | int | None:
+    raw = kv_get(con, runtime_setting_key(name))
+    if raw is None:
+        return default
+    try:
+        return int(raw) if name in RUNTIME_INT_SETTINGS else float(raw)
+    except Exception:
+        return default
+
+
+def set_runtime_setting(con: sqlite3.Connection, name: str, value: str | float | int) -> float | int:
+    if name not in RUNTIME_SETTINGS:
+        raise ValueError(f"unknown setting: {name}")
+    if name in RUNTIME_INT_SETTINGS:
+        parsed: float | int = int(value)
+        if parsed < 0:
+            raise ValueError("value must be >= 0")
+    else:
+        parsed = float(value)
+        if parsed < 0:
+            raise ValueError("value must be >= 0")
+    kv_set(con, runtime_setting_key(name), str(parsed))
+    return parsed
+
+
+def admin_reply(cfg: Config, chat_id: int | str, text: str) -> None:
+    tg_request(cfg, "sendMessage", {"chat_id": chat_id, "text": text[:MAX_TG_MESSAGE]})
+
+
+def process_admin_update(cfg: Config, con: sqlite3.Connection, update: dict[str, Any]) -> bool:
+    msg = update.get("message") if isinstance(update, dict) else None
+    if not isinstance(msg, dict):
+        return False
+    text = str(msg.get("text") or "").strip()
+    if not text.startswith("/"):
+        return False
+    chat = msg.get("chat") if isinstance(msg.get("chat"), dict) else {}
+    sender = msg.get("from") if isinstance(msg.get("from"), dict) else {}
+    chat_id = chat.get("id")
+    user_id = sender.get("id")
+    admin_id = str(cfg.telegram_admin_user_id or "").strip()
+    if not admin_id or str(user_id) != admin_id:
+        if chat_id is not None:
+            admin_reply(cfg, chat_id, "Нет доступа")
+        return False
+    parts = text.split()
+    cmd = parts[0].split("@", 1)[0].lower()
+    if cmd == "/set" and len(parts) == 3:
+        try:
+            value = set_runtime_setting(con, parts[1], parts[2])
+        except Exception as e:
+            admin_reply(cfg, chat_id, f"Ошибка: {e}")
+            return True
+        admin_reply(cfg, chat_id, f"OK: {parts[1]} = {value}")
+        return True
+    if cmd == "/get" and len(parts) == 2:
+        admin_reply(cfg, chat_id, f"{parts[1]} = {kv_get(con, runtime_setting_key(parts[1])) or 'default'}")
+        return True
+    if cmd in {"/help", "/start"}:
+        admin_reply(cfg, chat_id, "Команды: /status, /set <setting> <value>, /get <setting>. Настройки: " + ", ".join(sorted(RUNTIME_SETTINGS)))
+        return True
+    if cmd == "/status":
+        lines = ["Dragonfly admin settings:"]
+        for name in sorted(RUNTIME_SETTINGS):
+            val = kv_get(con, runtime_setting_key(name))
+            if val is not None:
+                lines.append(f"{name} = {val}")
+        if len(lines) == 1:
+            lines.append("все значения default")
+        admin_reply(cfg, chat_id, "\n".join(lines))
+        return True
+    admin_reply(cfg, chat_id, "Неизвестная команда. /help")
+    return True
+
+
+def process_admin_updates(cfg: Config, con: sqlite3.Connection, updates: list[dict[str, Any]]) -> int:
+    if not cfg.telegram_admin_user_id:
+        return 0
+    handled = 0
+    for update in updates:
+        if process_admin_update(cfg, con, update):
+            handled += 1
+    return handled
+
+
+def apply_runtime_settings(cfg: Config, con: sqlite3.Connection) -> None:
+    for name in (
+        "request_delay",
+        "send_delay",
+        "text_delay",
+        "photo_delay",
+        "album_delay",
+        "animation_delay",
+        "mixed_media_delay",
+        "media_item_delay",
+        "poll_interval",
+    ):
+        val = get_runtime_setting(con, name, None)
+        if val is not None:
+            setattr(cfg, name, float(val))
+
+
+def runtime_interval(con: sqlite3.Connection, setting_name: str, default: float | int) -> float:
+    val = get_runtime_setting(con, setting_name, None)
+    return float(val) if val is not None else float(default)
+
+
 def tg_get_updates(cfg: Config, con: sqlite3.Connection, *, timeout: int = 2) -> list[dict[str, Any]]:
     if cfg.dry_run or not cfg.telegram_token:
         return []
@@ -908,12 +1054,51 @@ def tg_get_updates(cfg: Config, con: sqlite3.Connection, *, timeout: int = 2) ->
         return []
     max_update_id: int | None = None
     clean = [u for u in updates if isinstance(u, dict)]
+    store_telegram_updates(con, clean)
     for upd in clean:
         if isinstance(upd.get("update_id"), int):
             max_update_id = max(max_update_id or 0, int(upd["update_id"]))
     if max_update_id is not None:
         kv_set(con, "telegram_updates_offset", str(max_update_id + 1))
     return clean
+
+
+def store_telegram_updates(con: sqlite3.Connection, updates: list[dict[str, Any]]) -> None:
+    rows = []
+    now = datetime.now(timezone.utc).isoformat()
+    for update in updates:
+        update_id = update.get("update_id") if isinstance(update, dict) else None
+        if isinstance(update_id, int):
+            rows.append((update_id, json.dumps(update, ensure_ascii=False), now))
+    if not rows:
+        return
+    con.executemany(
+        """
+        INSERT OR REPLACE INTO telegram_update_cache(update_id, payload_json, received_at)
+        VALUES(?, ?, ?)
+        """,
+        rows,
+    )
+    con.execute(
+        "DELETE FROM telegram_update_cache WHERE update_id NOT IN (SELECT update_id FROM telegram_update_cache ORDER BY update_id DESC LIMIT 1000)"
+    )
+    con.commit()
+
+
+def read_cached_telegram_updates(con: sqlite3.Connection, *, limit: int = 200) -> list[dict[str, Any]]:
+    rows = con.execute(
+        "SELECT payload_json FROM telegram_update_cache ORDER BY update_id DESC LIMIT ?",
+        (int(limit),),
+    ).fetchall()
+    updates = []
+    for (payload,) in reversed(rows):
+        try:
+            data = json.loads(payload)
+            if isinstance(data, dict):
+                updates.append(data)
+        except Exception:
+            continue
+    return updates
 
 
 def _discussion_message_matches(msg: dict[str, Any], discussion_chat_id: str, channel_message_id: int) -> bool:
@@ -977,7 +1162,7 @@ def try_capture_discussion_mapping(
     deadline = time.monotonic() + wait_seconds
     while True:
         try:
-            updates = tg_get_updates(cfg, con, timeout=int(update_timeout))
+            updates = read_cached_telegram_updates(con) + tg_get_updates(cfg, con, timeout=int(update_timeout))
         except Exception as e:
             log(f"discussion mapping getUpdates failed post #{post_id}: {e}", logging.WARNING)
             return None
@@ -2002,6 +2187,11 @@ def cmd_watch(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) ->
     log(f"watch started poll_interval={cfg.poll_interval}s send_delay={cfg.send_delay}s dry_run={cfg.dry_run}")
     while True:
         try:
+            apply_runtime_settings(cfg, con)
+            updates = tg_get_updates(cfg, con, timeout=0)
+            handled_admin = process_admin_updates(cfg, con, updates)
+            if handled_admin:
+                log(f"admin commands handled: {handled_admin}")
             posts = fetch_recent_posts(cfg, args.page_size)
             n = send_new_posts(cfg, con, posts)
             catchup = 0
@@ -2588,12 +2778,14 @@ def cmd_sync_comments(cfg: Config, con: sqlite3.Connection, args: argparse.Names
 def cmd_sync_comments_watch(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
     log(f"sync-comments-watch started interval={args.interval}s count={args.count} offset={getattr(args, 'offset', 0)} account={cfg.account_name or 'default'} dry_run={cfg.dry_run}")
     while True:
+        interval = runtime_interval(con, "comments_interval", args.interval)
         try:
+            apply_runtime_settings(cfg, con)
             cmd_sync_comments(cfg, con, args)
         except Exception as e:
             log_exception("sync-comments-watch loop error", e)
-            send_alert(cfg, "Ошибка sync-comments-watch", f"Зеркалирование комментариев не остановлено: попробую снова через {human_duration(args.interval)}. Причина: {str(e)[:500]}", level="error")
-        time.sleep(float(args.interval))
+            send_alert(cfg, "Ошибка sync-comments-watch", f"Зеркалирование комментариев не остановлено: попробую снова через {human_duration(interval)}. Причина: {str(e)[:500]}", level="error")
+        time.sleep(interval)
 
 
 def cmd_refresh_feed_cache(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
@@ -2608,17 +2800,19 @@ def cmd_refresh_feed_cache(cfg: Config, con: sqlite3.Connection, args: argparse.
 def cmd_refresh_feed_cache_watch(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
     log(f"feed-cache-watch started interval={args.interval}s count={args.count} offset={getattr(args, 'offset', 0)} account={cfg.account_name or 'default'} dry_run={cfg.dry_run}")
     while True:
+        interval = runtime_interval(con, "feed_cache_interval", args.interval)
         try:
+            apply_runtime_settings(cfg, con)
             cmd_refresh_feed_cache(cfg, con, args)
         except Exception as e:
             log_exception("feed-cache-watch loop error", e)
             send_alert(
                 cfg,
                 "Ошибка feed-cache-watch",
-                f"Кэш feed не остановлен: подожду {human_duration(args.interval)} и попробую снова. Причина: {str(e)[:500]}",
+                f"Кэш feed не остановлен: подожду {human_duration(interval)} и попробую снова. Причина: {str(e)[:500]}",
                 level="error",
             )
-        time.sleep(float(args.interval))
+        time.sleep(interval)
 
 
 def doctor_add(lines: list[str], ok: bool, label: str, detail: str = "") -> bool:
@@ -2741,18 +2935,21 @@ def cmd_sync_stats(cfg: Config, con: sqlite3.Connection, args: argparse.Namespac
 
 def cmd_sync_stats_watch(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
     log(f"sync-stats-watch started interval={args.interval}s count={args.count} offset={getattr(args, 'offset', 0)} account={cfg.account_name or 'default'} dry_run={cfg.dry_run}")
+    interval_setting = "stats_hot_interval" if int(getattr(args, "offset", 0) or 0) == 0 else "stats_cold_interval"
     while True:
+        interval = runtime_interval(con, interval_setting, args.interval)
         try:
+            apply_runtime_settings(cfg, con)
             cmd_sync_stats(cfg, con, args)
         except Exception as e:
             log_exception("sync-stats-watch loop error", e)
             send_alert(
                 cfg,
                 "Ошибка sync-stats-watch",
-                f"Мониторинг лайков/комментариев не остановлен: подожду {human_duration(args.interval)} и попробую снова. Причина: {str(e)[:500]}",
+                f"Мониторинг лайков/комментариев не остановлен: подожду {human_duration(interval)} и попробую снова. Причина: {str(e)[:500]}",
                 level="error",
             )
-        time.sleep(float(args.interval))
+        time.sleep(interval)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2780,6 +2977,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--discussion-chat-id", default=None, help="linked Telegram discussion group id; env TELEGRAM_DISCUSSION_CHAT_ID also works")
     p.add_argument("--best-chat-id", default=None, help="Telegram channel id for best posts; env TELEGRAM_BEST_CHAT_ID also works")
     p.add_argument("--dragonfly-user-id", default=None, help="Dragonfly user id for /api/get_comments; env DRAGONFLY_USER_ID also works")
+    p.add_argument("--telegram-admin-user-id", default=None, help="only this Telegram user id can use admin bot commands; env TELEGRAM_ADMIN_USER_ID also works")
     p.add_argument("--cookie-file", default=None, help="Dragonfly Mozilla/Netscape cookie jar; env DRAGONFLY_COOKIE_FILE also works. Preferred over legacy JWT.")
     p.add_argument("--accounts-file", default=None, help="JSON file with Dragonfly account tokens for 401/auth failover; env DRAGONFLY_ACCOUNTS_FILE also works.")
     p.add_argument("--dragonfly-account", default=None, help="pin this process to a named Dragonfly account from --accounts-file; does not rewrite active account")
@@ -2894,6 +3092,7 @@ def main() -> int:
         cookie_file=args.cookie_file or optional_env("DRAGONFLY_COOKIE_FILE"),
         accounts_file=args.accounts_file or optional_env("DRAGONFLY_ACCOUNTS_FILE"),
         account_name=args.dragonfly_account or None,
+        telegram_admin_user_id=args.telegram_admin_user_id or optional_env("TELEGRAM_ADMIN_USER_ID"),
     )
     if args.cmd == "import-state":
         return cmd_import_state(None, None, args)
