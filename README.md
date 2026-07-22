@@ -136,6 +136,7 @@ feed_cache_interval
 stats_hot_interval
 stats_cold_interval
 comments_interval
+best_likes_threshold
 ```
 
 Ручные `/set` и `/get` оставлены как fallback, если кнопки недоступны.
@@ -230,13 +231,13 @@ python3 dragonfly_telegram_poster.py \
 
 ## Канал «Лучшее»
 
-Посты, набравшие минимум 7 лайков, можно пересылать в отдельный канал:
+Посты, набравшие минимум 7 лайков по умолчанию, можно пересылать в отдельный канал:
 
 ```bash
 TELEGRAM_BEST_CHAT_ID=-100xxxxxxxxxx
 ```
 
-В текущей production-схеме отдельный `sync-best-watch` не нужен: `sync-stats` уже читает feed counters и сам пересылает qualifying posts в best channel с SQLite dedupe. Standalone `sync-best`/`sync-best-watch` оставлены для ручного backfill или изоляции.
+В текущей production-схеме отдельный `sync-best-watch` не нужен: `sync-stats` уже читает feed counters и сам пересылает qualifying posts в best channel с SQLite dedupe. Порог управляется в Telegram panel параметром `best_likes_threshold` и применяется на следующей итерации stats watcher'а без рестарта. Standalone `sync-best`/`sync-best-watch` оставлены для ручного backfill или изоляции и тоже учитывают runtime override.
 
 ## Stats footer
 

@@ -403,6 +403,49 @@ class DragonflyPosterTests(unittest.TestCase):
         community_post = post(author_link='?community=myeyes')
         self.assertEqual(poster.profile_url(community_post), 'https://dragonfly-flash.ru/?community=myeyes')
 
+    def test_best_likes_threshold_is_runtime_int_setting_in_panel(self):
+        con = poster.init_db(Path(':memory:'))
+        text, markup = poster.build_admin_panel(con)
+        keyboard_text = json.dumps(markup, ensure_ascii=False)
+        self.assertIn('⭐ Лучшее от лайков', keyboard_text)
+        detail, detail_markup = poster.build_setting_detail(con, 'best_likes_threshold')
+        self.assertIn('Текущее значение: 7 лайков (default)', detail)
+        self.assertIn('минимум лайков', detail)
+        self.assertIn('10 лайков', json.dumps(detail_markup, ensure_ascii=False))
+
+    def test_best_likes_threshold_runtime_setting_applies_to_config(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.best_likes_threshold = 7
+        value = poster.set_runtime_setting(con, 'best_likes_threshold', '10')
+        poster.apply_runtime_settings(c, con)
+        self.assertEqual(value, 10)
+        self.assertEqual(c.best_likes_threshold, 10)
+
+    def test_sync_stats_uses_runtime_best_likes_threshold(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        c.telegram_token = 'tg'
+        c.best_chat_id = '-100best'
+        c.best_likes_threshold = 7
+        poster.record_telegram_message(con, post(post_id=779, likes_count=6, comments_count=0), chat_id='@channel', message_id=111, message_kind='text', base_html='base', role='main')
+        poster.set_runtime_setting(con, 'best_likes_threshold', '10')
+        calls = []
+        orig_fetch = poster.fetch_recent_posts
+        orig_tg = poster.tg_request
+        poster.fetch_recent_posts = lambda cfg, count, start_offset=0: [post(post_id=779, likes_count=8, comments_count=0)]
+        poster.tg_request = lambda cfg, method, payload: calls.append((method, payload)) or {'ok': True, 'result': {'message_id': 211}}
+        try:
+            poster.apply_runtime_settings(c, con)
+            rc = poster.cmd_sync_stats(c, con, type('Args', (), {'count': 1, 'offset': 0})())
+        finally:
+            poster.fetch_recent_posts = orig_fetch
+            poster.tg_request = orig_tg
+        self.assertEqual(rc, 0)
+        self.assertEqual([m for m, _ in calls], ['editMessageText'])
+        self.assertFalse(poster.is_best_post_sent(con, 779))
+
     def test_runtime_settings_apply_to_config_without_restart(self):
         con = poster.init_db(Path(':memory:'))
         c = cfg()
@@ -1720,6 +1763,29 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual([m for m, _ in calls], ['editMessageText', 'forwardMessage'])
         self.assertTrue(poster.is_best_post_sent(con, 778))
+
+    def test_cmd_sync_best_uses_runtime_threshold_when_present(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        c.best_chat_id = '-100best'
+        c.telegram_token = 'tg'
+        c.best_likes_threshold = 7
+        poster.record_telegram_message(con, post(post_id=780, likes_count=6), chat_id='@channel', message_id=112, message_kind='text', base_html='base', role='main')
+        poster.set_runtime_setting(con, 'best_likes_threshold', '10')
+        calls = []
+        orig_fetch = poster.fetch_recent_posts
+        orig_tg = poster.tg_request
+        poster.fetch_recent_posts = lambda cfg, count, start_offset=0: [post(post_id=780, likes_count=8)]
+        poster.tg_request = lambda cfg, method, payload: calls.append((method, payload)) or {'ok': True, 'result': {'message_id': 212}}
+        try:
+            rc = poster.cmd_sync_best(c, con, type('Args', (), {'count': 1, 'offset': 0, 'threshold': 7})())
+        finally:
+            poster.fetch_recent_posts = orig_fetch
+            poster.tg_request = orig_tg
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [])
+        self.assertFalse(poster.is_best_post_sent(con, 780))
 
     def test_sync_best_post_forwards_once_and_records_dedupe(self):
         con = poster.init_db(Path(':memory:'))

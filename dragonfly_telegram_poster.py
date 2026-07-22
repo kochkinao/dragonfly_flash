@@ -929,6 +929,7 @@ RUNTIME_INT_SETTINGS = {
     "stats_hot_count",
     "stats_cold_count",
     "comments_hot_count",
+    "best_likes_threshold",
 }
 RUNTIME_SETTING_ORDER = [
     "request_delay",
@@ -942,6 +943,7 @@ RUNTIME_SETTING_ORDER = [
     "stats_hot_interval",
     "stats_cold_interval",
     "comments_interval",
+    "best_likes_threshold",
 ]
 RUNTIME_SETTING_META = {
     "request_delay": {
@@ -1008,7 +1010,15 @@ RUNTIME_SETTING_META = {
         "label": "💬 Комменты",
         "default": 30.0,
         "values": [20, 30, 45, 60, 90],
+        "unit": "сек",
         "description": "Как часто проверять и зеркалить новые Dragonfly-комментарии в Telegram discussion group.",
+    },
+    "best_likes_threshold": {
+        "label": "⭐ Лучшее от лайков",
+        "default": 7,
+        "values": [3, 5, 7, 10, 15, 20],
+        "unit": "лайков",
+        "description": "минимум лайков, после которого опубликованный пост автоматически пересылается в канал «Стрекоза | Лучшее».",
     },
 }
 RUNTIME_SETTINGS = RUNTIME_FLOAT_SETTINGS | RUNTIME_INT_SETTINGS
@@ -1055,6 +1065,15 @@ def runtime_setting_display(con: sqlite3.Connection, name: str) -> str:
 def setting_label(name: str) -> str:
     meta = RUNTIME_SETTING_META.get(name) or {}
     return str(meta.get("label") or name)
+
+
+def setting_unit(name: str) -> str:
+    meta = RUNTIME_SETTING_META.get(name) or {}
+    return str(meta.get("unit") or "сек")
+
+
+def format_setting_value(value: float | int, name: str) -> str:
+    return f"{float(value):g} {setting_unit(name)}"
 
 
 def setting_default(name: str) -> float:
@@ -1108,7 +1127,7 @@ def build_setting_detail(con: sqlite3.Connection, name: str) -> tuple[str, dict[
     meta = RUNTIME_SETTING_META[name]
     current = setting_current_value(con, name)
     configured = kv_get(con, runtime_setting_key(name))
-    current_note = f"{current:g} сек" + (" (default)" if configured is None else "")
+    current_note = format_setting_value(current, name) + (" (default)" if configured is None else "")
     text = (
         f"{meta['label']}\n\n"
         f"Что регулирует:\n{meta['description']}\n\n"
@@ -1119,7 +1138,7 @@ def build_setting_detail(con: sqlite3.Connection, name: str) -> tuple[str, dict[
     rows: list[list[dict[str, str]]] = []
     for i in range(0, len(values), 3):
         rows.append([
-            {"text": f"{float(v):g} сек", "callback_data": f"admin:set:{name}:{float(v):g}"}
+            {"text": format_setting_value(v, name), "callback_data": f"admin:set:{name}:{float(v):g}"}
             for v in values[i:i + 3]
         ])
     rows.append([
@@ -1140,7 +1159,7 @@ def edit_setting_detail(cfg: Config, con: sqlite3.Connection, chat_id: int | str
 def admin_status_text(con: sqlite3.Connection) -> str:
     lines = ["📊 Dragonfly settings"]
     for name in RUNTIME_SETTING_ORDER:
-        lines.append(f"{setting_label(name)}: {setting_current_value(con, name):g} сек")
+        lines.append(f"{setting_label(name)}: {format_setting_value(setting_current_value(con, name), name)}")
     return "\n".join(lines)
 
 
@@ -1168,7 +1187,7 @@ def process_admin_callback(cfg: Config, con: sqlite3.Connection, callback: dict[
     if action == "set" and len(parts) == 4 and parts[2] in RUNTIME_SETTING_META:
         name = parts[2]
         value = set_runtime_setting(con, name, parts[3])
-        note = f"✅ Установлено: {setting_label(name)} = {float(value):g} сек"
+        note = f"✅ Установлено: {setting_label(name)} = {format_setting_value(value, name)}"
         tg_request(cfg, "answerCallbackQuery", {"callback_query_id": callback.get("id"), "text": note, "show_alert": False})
         if chat_id is not None and message_id is not None:
             edit_setting_detail(cfg, con, chat_id, int(message_id), name, note=note)
@@ -1186,7 +1205,7 @@ def process_admin_callback(cfg: Config, con: sqlite3.Connection, callback: dict[
         kv_set(con, pending_setting_key(sender.get("id")), name)
         tg_request(cfg, "answerCallbackQuery", {"callback_query_id": callback.get("id"), "text": "Жду значение сообщением", "show_alert": False})
         if chat_id is not None:
-            admin_reply(cfg, chat_id, f"✍️ Введи новое значение в секундах для {setting_label(name)}. Например: 45")
+            admin_reply(cfg, chat_id, f"✍️ Введи новое значение для {setting_label(name)}. Например: 45")
         return True
     if action == "reset_defaults":
         reset_runtime_settings(con)
@@ -1236,10 +1255,10 @@ def process_admin_update(cfg: Config, con: sqlite3.Connection, update: dict[str,
         try:
             value = set_runtime_setting(con, pending_name, text.replace(",", "."))
         except Exception:
-            admin_reply(cfg, chat_id, f"Не понял значение. Введи число секунд для {setting_label(pending_name)}, например: 45")
+            admin_reply(cfg, chat_id, f"Не понял значение. Введи число для {setting_label(pending_name)}, например: 45")
             return True
         kv_delete(con, pending_setting_key(user_id))
-        admin_reply(cfg, chat_id, f"✅ Установлено: {setting_label(pending_name)} = {float(value):g} сек")
+        admin_reply(cfg, chat_id, f"✅ Установлено: {setting_label(pending_name)} = {format_setting_value(value, pending_name)}")
         return True
     if not text.startswith("/"):
         return False
@@ -1322,6 +1341,9 @@ def apply_runtime_settings(cfg: Config, con: sqlite3.Connection) -> None:
         val = get_runtime_setting(con, name, None)
         if val is not None:
             setattr(cfg, name, float(val))
+    val = get_runtime_setting(con, "best_likes_threshold", None)
+    if val is not None:
+        cfg.best_likes_threshold = int(val)
 
 
 def runtime_interval(con: sqlite3.Connection, setting_name: str, default: float | int) -> float:
@@ -2839,7 +2861,9 @@ def sync_best_post(cfg: Config, con: sqlite3.Connection, post: dict[str, Any], *
 def cmd_sync_best(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
     if not cfg.best_chat_id:
         raise SystemExit("Set TELEGRAM_BEST_CHAT_ID or --best-chat-id")
-    cfg.best_likes_threshold = int(args.threshold)
+    apply_runtime_settings(cfg, con)
+    threshold = int(get_runtime_setting(con, "best_likes_threshold", int(args.threshold)) or int(args.threshold))
+    cfg.best_likes_threshold = threshold
     old_limit = cfg.limit
     try:
         cfg.limit = max(cfg.limit, int(args.count))
@@ -2851,12 +2875,12 @@ def cmd_sync_best(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace
     for p in posts[: int(args.count)]:
         seen += 1
         try:
-            if sync_best_post(cfg, con, p, threshold=int(args.threshold)):
+            if sync_best_post(cfg, con, p, threshold=threshold):
                 sent += 1
         except Exception as e:
             log_exception(f"best sync failed post #{p.get('post_id')}", e)
             send_alert(cfg, "Ошибка пересылки в Лучшее", f"Пост #{p.get('post_id')}: {str(e)[:500]}", level="warning")
-    log(f"sync-best done checked={seen} sent={sent} threshold={int(args.threshold)}")
+    log(f"sync-best done checked={seen} sent={sent} threshold={threshold}")
     return 0
 
 
