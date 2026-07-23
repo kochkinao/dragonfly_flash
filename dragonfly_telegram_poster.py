@@ -1971,8 +1971,6 @@ def post_meta_html(post: dict[str, Any]) -> str:
     poll = poll_info_html(post)
     if poll:
         parts.append(poll)
-    if post.get("is_repost"):
-        parts.append("🔄 репост")
     return "\n".join(parts)
 
 

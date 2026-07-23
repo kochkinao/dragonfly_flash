@@ -379,6 +379,7 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertIn('литературный клуб', html)
         self.assertIn('Текст из паблика', html)
         self.assertIn('https://dragonfly-flash.ru/?community=myeyes', html)
+        self.assertNotIn('🔄 репост', html)
 
     def test_poll_only_post_is_publishable_and_renders_results(self):
         poll_post = post(
