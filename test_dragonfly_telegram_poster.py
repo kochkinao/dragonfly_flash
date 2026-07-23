@@ -1312,6 +1312,50 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertEqual(processed, 1)
         self.assertTrue(poster.is_sent(con, 102))
 
+    def test_send_new_posts_skips_post_already_reserved_as_sending(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        con.execute(
+            """
+            INSERT INTO sent_posts(post_id, created_at, sent_at, author_name, had_photos, status, failed_attempts, last_error)
+            VALUES(?, ?, ?, ?, ?, 'sending', 0, NULL)
+            """,
+            (321, '2026-07-20T08:00:00', poster.datetime.now(poster.timezone.utc).isoformat(), 'Alice', 1),
+        )
+        con.commit()
+        orig_send = poster.send_post
+        poster.send_post = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError('reserved post was sent again'))
+        try:
+            processed = poster.send_new_posts(c, con, [post(post_id=321, description='dupe guard')])
+        finally:
+            poster.send_post = orig_send
+
+        self.assertEqual(processed, 0)
+
+    def test_send_new_posts_reserves_post_before_telegram_send(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        seen_status = []
+        orig_send = poster.send_post
+        orig_sleep = poster.time.sleep
+        def fake_send(_cfg, p, **_kwargs):
+            row = con.execute("SELECT status FROM sent_posts WHERE post_id = ?", (int(p['post_id']),)).fetchone()
+            seen_status.append(row[0] if row else None)
+            return {'message_id': 444, 'message_kind': 'text', 'base_html': 'base'}
+        poster.send_post = fake_send
+        poster.time.sleep = lambda *_: None
+        try:
+            processed = poster.send_new_posts(c, con, [post(post_id=322, description='reserved first')])
+        finally:
+            poster.send_post = orig_send
+            poster.time.sleep = orig_sleep
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(seen_status, ['sending'])
+        self.assertTrue(poster.is_sent(con, 322))
+
     def test_media_failure_falls_back_to_text_with_original_link(self):
         calls = []
         orig = poster.tg_request

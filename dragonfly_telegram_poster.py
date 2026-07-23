@@ -665,6 +665,85 @@ def failed_attempts(con: sqlite3.Connection, post_id: int) -> int:
     return int(row[0] or 0)
 
 
+def _parse_utc_datetime(value: str) -> datetime | None:
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def release_stale_post_reservations(con: sqlite3.Connection, *, max_age_seconds: int = 900, now: str | None = None) -> int:
+    """Release crashed/overlapped post send reservations.
+
+    A row in status='sending' means a process already passed the duplicate guard
+    but has not yet recorded the Telegram result. If that process dies, the row
+    must eventually be released so the post can retry.
+    """
+    now_dt = _parse_utc_datetime(now) if now is not None else datetime.now(timezone.utc)
+    if now_dt is None:
+        now_dt = datetime.now(timezone.utc)
+    stale: list[int] = []
+    for pid, sent_at in con.execute("SELECT post_id, sent_at FROM sent_posts WHERE status = 'sending'").fetchall():
+        sent_dt = _parse_utc_datetime(str(sent_at or ""))
+        if sent_dt is None or (now_dt - sent_dt).total_seconds() >= max_age_seconds:
+            stale.append(int(pid))
+    if not stale:
+        return 0
+    con.executemany(
+        """
+        UPDATE sent_posts
+        SET status = 'failed', last_error = 'stale send reservation released'
+        WHERE post_id = ? AND status = 'sending'
+        """,
+        [(pid,) for pid in stale],
+    )
+    con.commit()
+    log(f"released stale post send reservations: {len(stale)}", logging.WARNING)
+    return len(stale)
+
+
+def reserve_post_for_send(con: sqlite3.Connection, post: dict[str, Any], *, max_attempts: int) -> bool:
+    """Atomically reserve a post before calling Telegram send APIs."""
+    pid = int(post["post_id"])
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT status, failed_attempts FROM sent_posts WHERE post_id = ?", (pid,)).fetchone()
+        if row:
+            status = str(row[0] or "")
+            attempts = int(row[1] or 0)
+            if status in {"sent", "sending"} or (status == "failed" and attempts >= max_attempts):
+                con.rollback()
+                return False
+            con.execute(
+                """
+                UPDATE sent_posts
+                SET created_at = ?, sent_at = ?, author_name = ?, had_photos = ?, status = 'sending', last_error = NULL
+                WHERE post_id = ?
+                """,
+                (post.get("created_at"), now, post.get("author_name"), 1 if post.get("photos") else 0, pid),
+            )
+        else:
+            con.execute(
+                """
+                INSERT INTO sent_posts(post_id, created_at, sent_at, author_name, had_photos, status, failed_attempts, last_error)
+                VALUES(?, ?, ?, ?, ?, 'sending', 0, NULL)
+                """,
+                (pid, post.get("created_at"), now, post.get("author_name"), 1 if post.get("photos") else 0),
+            )
+        con.commit()
+        return True
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        raise
+
+
 def mark_sent(con: sqlite3.Connection, post: dict[str, Any]) -> None:
     con.execute(
         """
@@ -2469,6 +2548,8 @@ def delay_for_post(cfg: Config, post: dict[str, Any]) -> float:
 
 
 def send_new_posts(cfg: Config, con: sqlite3.Connection, posts_newest_first: list[dict[str, Any]], *, mark_only: bool = False) -> int:
+    if not cfg.dry_run:
+        release_stale_post_reservations(con, max_age_seconds=900)
     # Send oldest -> newest so channel chronology is natural.
     new_posts = [
         p for p in reversed(posts_newest_first)
@@ -2488,8 +2569,11 @@ def send_new_posts(cfg: Config, con: sqlite3.Connection, posts_newest_first: lis
             sent += 1
             log(f"marked seen #{pid}")
             continue
+        attempts_before = failed_attempts(con, pid)
+        if not cfg.dry_run and not reserve_post_for_send(con, p, max_attempts=cfg.max_attempts):
+            log(f"skipped post #{pid}: already sent/reserved/exhausted", logging.DEBUG)
+            continue
         try:
-            attempts_before = failed_attempts(con, pid)
             allow_fallback = attempts_before >= max(0, cfg.max_attempts - 1)
             sent_info = send_post(cfg, p, allow_fallback=allow_fallback)
             if not cfg.dry_run:
