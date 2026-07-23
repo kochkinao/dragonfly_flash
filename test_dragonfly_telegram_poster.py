@@ -1799,20 +1799,26 @@ class DragonflyPosterTests(unittest.TestCase):
         calls = []
         seq = {'message_id': 200}
         orig = poster.tg_request
-        poster.tg_request = lambda cfg, method, payload: calls.append((method, payload)) or {'ok': True, 'result': {'message_id': seq.__setitem__('message_id', seq['message_id'] + 1) or seq['message_id']}}
+        def fake_best_tg_request(cfg, method, payload):
+            calls.append((method, payload))
+            if method == 'forwardMessages':
+                return {'ok': True, 'result': [{'message_id': 201}, {'message_id': 202}]}
+            seq['message_id'] += 1
+            return {'ok': True, 'result': {'message_id': seq['message_id']}}
+        poster.tg_request = fake_best_tg_request
         try:
             self.assertTrue(poster.sync_best_post(c, con, post(post_id=777, likes_count=7), threshold=7))
             self.assertFalse(poster.sync_best_post(c, con, post(post_id=777, likes_count=9), threshold=7))
         finally:
             poster.tg_request = orig
 
-        self.assertEqual([m for m, _p in calls], ['forwardMessage', 'forwardMessage'])
+        self.assertEqual([m for m, _p in calls], ['forwardMessages'])
         self.assertEqual(calls[0][1]['chat_id'], '-100best')
-        self.assertEqual(calls[0][1]['message_id'], 100)
-        self.assertEqual(calls[1][1]['message_id'], 101)
-        row = con.execute('SELECT likes_at_send, source_message_ids FROM best_posts WHERE post_id=777').fetchone()
+        self.assertEqual(calls[0][1]['message_ids'], [100, 101])
+        row = con.execute('SELECT likes_at_send, source_message_ids, best_message_ids FROM best_posts WHERE post_id=777').fetchone()
         self.assertEqual(row[0], 7)
         self.assertEqual(json.loads(row[1]), [100, 101])
+        self.assertEqual(json.loads(row[2]), [201, 202])
 
     def test_sync_best_post_ignores_posts_below_threshold(self):
         con = poster.init_db(Path(':memory:'))

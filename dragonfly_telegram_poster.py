@@ -694,6 +694,19 @@ def _message_id_from_result(result: Any) -> int | None:
     return None
 
 
+def _message_ids_from_tg_response(resp: dict[str, Any]) -> list[int]:
+    result = resp.get("result") if isinstance(resp, dict) else None
+    if isinstance(result, list):
+        ids: list[int] = []
+        for item in result:
+            mid = _message_id_from_result(item)
+            if mid is not None:
+                ids.append(int(mid))
+        return ids
+    mid = _message_id_from_result(result)
+    return [int(mid)] if mid is not None else []
+
+
 def _message_id_from_tg_response(resp: dict[str, Any]) -> int | None:
     result = resp.get("result") if isinstance(resp, dict) else None
     if isinstance(result, list) and result:
@@ -2815,16 +2828,37 @@ def source_message_ids_for_best(con: sqlite3.Connection, post_id: int) -> tuple[
 def forward_to_best(cfg: Config, *, source_chat_id: str, source_message_ids: list[int]) -> list[int]:
     if not cfg.best_chat_id:
         raise RuntimeError("TELEGRAM_BEST_CHAT_ID / --best-chat-id is required for best-post forwarding")
+    clean_ids = [int(mid) for mid in source_message_ids]
+    if not clean_ids:
+        return []
+    if len(clean_ids) == 1:
+        resp = tg_request(
+            cfg,
+            "forwardMessage",
+            {"chat_id": cfg.best_chat_id, "from_chat_id": source_chat_id, "message_id": clean_ids[0]},
+        )
+        return _message_ids_from_tg_response(resp)
+    try:
+        resp = tg_request(
+            cfg,
+            "forwardMessages",
+            {"chat_id": cfg.best_chat_id, "from_chat_id": source_chat_id, "message_ids": clean_ids},
+        )
+        forwarded_ids = _message_ids_from_tg_response(resp)
+        if forwarded_ids:
+            return forwarded_ids
+        log("best batch forward returned no message ids; falling back to per-message forward", logging.WARNING)
+    except Exception as e:
+        log(f"best batch forward failed, falling back to per-message forward: {e}", logging.WARNING)
+
     forwarded_ids: list[int] = []
-    for mid in source_message_ids:
+    for mid in clean_ids:
         resp = tg_request(
             cfg,
             "forwardMessage",
             {"chat_id": cfg.best_chat_id, "from_chat_id": source_chat_id, "message_id": int(mid)},
         )
-        new_mid = _message_id_from_tg_response(resp)
-        if new_mid is not None:
-            forwarded_ids.append(int(new_mid))
+        forwarded_ids.extend(_message_ids_from_tg_response(resp))
         time.sleep(max(0.0, cfg.send_delay))
     return forwarded_ids
 
