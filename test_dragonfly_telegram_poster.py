@@ -1545,6 +1545,23 @@ class DragonflyPosterTests(unittest.TestCase):
         rows = con.execute('SELECT comment_id, telegram_message_id FROM dragonfly_comments WHERE post_id=908').fetchall()
         self.assertEqual(rows, [(30, poster.COMMENT_SEND_RESERVED_MESSAGE_ID)])
 
+    def test_release_stale_comment_reservations_only_clears_old_inflight_rows(self):
+        con = poster.init_db(Path(':memory:'))
+        old_comment = {'id': 31, 'username': 'Alice', 'text': 'old race', 'created_at': '2026-07-21T10:00:00', 'likes_count': 0}
+        fresh_comment = {'id': 32, 'username': 'Bob', 'text': 'fresh race', 'created_at': '2026-07-21T10:01:00', 'likes_count': 0}
+        poster.reserve_comment_for_send(con, post_id=908, comment=old_comment)
+        poster.reserve_comment_for_send(con, post_id=908, comment=fresh_comment)
+        con.execute(
+            "UPDATE dragonfly_comments SET sent_at = '2026-07-21T10:00:00+00:00' WHERE comment_id = 31"
+        )
+        con.commit()
+
+        released = poster.release_stale_comment_reservations(con, max_age_seconds=60, now='2026-07-21T10:10:00+00:00')
+
+        self.assertEqual(released, 1)
+        rows = con.execute('SELECT comment_id, telegram_message_id FROM dragonfly_comments WHERE post_id=908 ORDER BY comment_id').fetchall()
+        self.assertEqual(rows, [(31, None), (32, poster.COMMENT_SEND_RESERVED_MESSAGE_ID)])
+
     def test_sync_comments_skips_old_post_when_feed_comment_count_unchanged(self):
         con = poster.init_db(Path(':memory:'))
         c = cfg()

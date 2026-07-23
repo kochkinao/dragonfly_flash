@@ -3079,6 +3079,52 @@ def release_comment_reservation(con: sqlite3.Connection, *, post_id: int, commen
     con.commit()
 
 
+def release_stale_comment_reservations(
+    con: sqlite3.Connection,
+    *,
+    max_age_seconds: int = 900,
+    now: str | datetime | None = None,
+) -> int:
+    def _parse_dt(value: str) -> datetime | None:
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+    now_dt = _parse_dt(str(now)) if now is not None else datetime.now(timezone.utc)
+    if now_dt is None:
+        now_dt = datetime.now(timezone.utc)
+    cutoff = now_dt.timestamp() - int(max_age_seconds)
+    rows = con.execute(
+        """
+        SELECT post_id, comment_id, sent_at
+        FROM dragonfly_comments
+        WHERE telegram_message_id = ?
+        """,
+        (COMMENT_SEND_RESERVED_MESSAGE_ID,),
+    ).fetchall()
+    stale: list[tuple[int, int]] = []
+    for row in rows:
+        sent_at = _parse_dt(str(row[2] or ""))
+        if sent_at is not None and sent_at.timestamp() <= cutoff:
+            stale.append((int(row[0]), int(row[1])))
+    for post_id, comment_id in stale:
+        con.execute(
+            """
+            UPDATE dragonfly_comments
+            SET telegram_message_id = NULL
+            WHERE post_id = ? AND comment_id = ? AND telegram_message_id = ?
+            """,
+            (post_id, comment_id, COMMENT_SEND_RESERVED_MESSAGE_ID),
+        )
+    if stale:
+        con.commit()
+        log(f"released stale comment reservations: {len(stale)}", logging.WARNING)
+    return len(stale)
+
+
 def mark_comment_sent(
     con: sqlite3.Connection,
     *,
@@ -3290,6 +3336,7 @@ def get_recent_posts_for_command(cfg: Config, con: sqlite3.Connection, args: arg
 
 
 def cmd_sync_comments(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
+    release_stale_comment_reservations(con, max_age_seconds=900)
     repair_count = max(200, int(getattr(args, "offset", 0)) + int(args.count) + 50)
     repair_discussion_mappings_from_cached_updates(
         cfg,
