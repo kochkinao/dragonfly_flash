@@ -3207,44 +3207,69 @@ def missing_discussion_mappings(con: sqlite3.Connection, *, count: int, role: st
     return rows
 
 
+def repair_discussion_mappings_from_cached_updates(
+    cfg: Config,
+    con: sqlite3.Connection,
+    *,
+    count: int,
+    role: str = "last",
+    update_limit: int = 1000,
+    verbose_done: bool = True,
+) -> tuple[int, int]:
+    if not cfg.discussion_chat_id:
+        return (0, 0)
+    rows = missing_discussion_mappings(con, count=int(count), role=role)
+    pending = {int(row["message_id"]): row for row in rows}
+    repaired = 0
+    if pending:
+        try:
+            updates = read_cached_telegram_updates(con, limit=int(update_limit))
+        except Exception as e:
+            log(f"repair-discussion-mapping cache read failed: {e}", logging.WARNING)
+            updates = []
+        for upd in updates:
+            msg = upd.get("message") or upd.get("channel_post") or {}
+            if not isinstance(msg, dict):
+                continue
+            did = msg.get("message_id")
+            if not isinstance(did, int):
+                continue
+            for channel_message_id, row in list(pending.items()):
+                if _discussion_message_matches(msg, str(cfg.discussion_chat_id), int(channel_message_id)):
+                    save_discussion_message(
+                        con,
+                        post_id=int(row["post_id"]),
+                        role=str(row["role"]),
+                        channel_chat_id=str(row["chat_id"]),
+                        channel_message_id=int(channel_message_id),
+                        discussion_chat_id=str(cfg.discussion_chat_id),
+                        discussion_message_id=int(did),
+                    )
+                    log(
+                        f"discussion mapping repaired post #{int(row['post_id'])} role={row['role']} "
+                        f"channel_message_id={channel_message_id} discussion_message_id={did}"
+                    )
+                    repaired += 1
+                    pending.pop(channel_message_id, None)
+                    break
+            if not pending:
+                break
+    if verbose_done:
+        log(f"repair-discussion-mapping done checked={len(rows)} repaired={repaired}")
+    return (len(rows), repaired)
+
+
 def cmd_repair_discussion_mapping(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
     if not cfg.discussion_chat_id:
         raise SystemExit("Set TELEGRAM_DISCUSSION_CHAT_ID or --discussion-chat-id")
-    rows = missing_discussion_mappings(con, count=int(args.count), role="last")
-    repaired = 0
-    try:
-        updates = tg_get_updates(cfg, con, timeout=int(getattr(args, "update_timeout", 0)))
-    except Exception as e:
-        log(f"repair-discussion-mapping getUpdates failed: {e}", logging.WARNING)
-        log(f"repair-discussion-mapping done checked={len(rows)} repaired=0")
-        return 0
-    pending = {int(row["message_id"]): row for row in rows}
-    for upd in updates:
-        msg = upd.get("message") or upd.get("channel_post") or {}
-        if not isinstance(msg, dict):
-            continue
-        did = msg.get("message_id")
-        if not isinstance(did, int):
-            continue
-        for channel_message_id, row in list(pending.items()):
-            if _discussion_message_matches(msg, str(cfg.discussion_chat_id), int(channel_message_id)):
-                save_discussion_message(
-                    con,
-                    post_id=int(row["post_id"]),
-                    role=str(row["role"]),
-                    channel_chat_id=str(row["chat_id"]),
-                    channel_message_id=int(channel_message_id),
-                    discussion_chat_id=str(cfg.discussion_chat_id),
-                    discussion_message_id=int(did),
-                )
-                log(
-                    f"discussion mapping repaired post #{int(row['post_id'])} role={row['role']} "
-                    f"channel_message_id={channel_message_id} discussion_message_id={did}"
-                )
-                repaired += 1
-                pending.pop(channel_message_id, None)
-                break
-    log(f"repair-discussion-mapping done checked={len(rows)} repaired={repaired}")
+    repair_discussion_mappings_from_cached_updates(
+        cfg,
+        con,
+        count=int(args.count),
+        role="last",
+        update_limit=int(getattr(args, "update_limit", 1000)),
+        verbose_done=True,
+    )
     return 0
 
 
@@ -3265,6 +3290,15 @@ def get_recent_posts_for_command(cfg: Config, con: sqlite3.Connection, args: arg
 
 
 def cmd_sync_comments(cfg: Config, con: sqlite3.Connection, args: argparse.Namespace) -> int:
+    repair_count = max(200, int(getattr(args, "offset", 0)) + int(args.count) + 50)
+    repair_discussion_mappings_from_cached_updates(
+        cfg,
+        con,
+        count=repair_count,
+        role="last",
+        update_limit=1000,
+        verbose_done=False,
+    )
     posts = get_recent_posts_for_command(cfg, con, args)
     total_sent = 0
     total_marked = 0
@@ -3552,10 +3586,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--offset", type=int, default=0, help="Dragonfly feed offset; useful for sharding read-only watchers")
     s.add_argument("--use-feed-cache", action="store_true", help="read post window from SQLite feed cache instead of Dragonfly feed API")
 
-    s = sub.add_parser("repair-discussion-mapping", help="retry mapping channel posts to Telegram discussion messages")
+    s = sub.add_parser("repair-discussion-mapping", help="repair channel-to-discussion mappings from cached Telegram updates")
     s.add_argument("--count", type=int, default=200, help="missing role=last mappings to inspect")
-    s.add_argument("--wait-seconds", type=float, default=0.0, help="seconds to wait for updates per missing mapping")
-    s.add_argument("--update-timeout", type=int, default=0, help="Bot API getUpdates timeout per attempt; keep 0 for fast one-shot repair")
+    s.add_argument("--update-limit", type=int, default=1000, help="cached Telegram updates to scan")
 
     s = sub.add_parser("sync-comments", help="one-shot mirror of new Dragonfly comments into Telegram discussion")
     s.add_argument("--count", type=int, default=20, help="recent Dragonfly posts to inspect")

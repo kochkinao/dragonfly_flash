@@ -1352,7 +1352,7 @@ class DragonflyPosterTests(unittest.TestCase):
         row = con.execute("SELECT discussion_chat_id, discussion_message_id FROM telegram_discussion_messages WHERE post_id=901 AND role='last'").fetchone()
         self.assertEqual(row, ('-100222', 777))
 
-    def test_repair_discussion_mapping_recovers_missing_last_mapping(self):
+    def test_repair_discussion_mapping_recovers_missing_last_mapping_from_cache(self):
         con = poster.init_db(Path(':memory:'))
         c = cfg()
         c.dry_run = False
@@ -1367,7 +1367,7 @@ class DragonflyPosterTests(unittest.TestCase):
             base_html='base',
             role='last',
         )
-        updates = [{
+        poster.store_telegram_updates(con, [{
             'update_id': 12,
             'message': {
                 'message_id': 778,
@@ -1375,11 +1375,11 @@ class DragonflyPosterTests(unittest.TestCase):
                 'is_automatic_forward': True,
                 'forward_origin': {'message_id': 556, 'chat': {'id': -100111}},
             },
-        }]
+        }])
         orig = poster.tg_request
-        poster.tg_request = lambda cfg, method, payload: {'ok': True, 'result': updates}
+        poster.tg_request = lambda cfg, method, payload: (_ for _ in ()).throw(AssertionError('repair must not call getUpdates'))
         try:
-            rc = poster.cmd_repair_discussion_mapping(c, con, type('Args', (), {'count': 10, 'wait_seconds': 0})())
+            rc = poster.cmd_repair_discussion_mapping(c, con, type('Args', (), {'count': 10, 'wait_seconds': 0, 'update_timeout': 0})())
         finally:
             poster.tg_request = orig
 
@@ -1387,33 +1387,7 @@ class DragonflyPosterTests(unittest.TestCase):
         row = con.execute("SELECT discussion_message_id FROM telegram_discussion_messages WHERE post_id=909 AND role='last'").fetchone()
         self.assertEqual(row, (778,))
 
-    def test_repair_discussion_mapping_uses_configured_update_timeout(self):
-        con = poster.init_db(Path(':memory:'))
-        c = cfg()
-        c.dry_run = False
-        c.telegram_token = 'tg'
-        c.discussion_chat_id = '-100222'
-        poster.record_telegram_message(
-            con,
-            post(post_id=910),
-            chat_id='@channel',
-            message_id=557,
-            message_kind='text',
-            base_html='base',
-            role='last',
-        )
-        payloads = []
-        orig = poster.tg_request
-        poster.tg_request = lambda cfg, method, payload: payloads.append(payload) or {'ok': True, 'result': []}
-        try:
-            rc = poster.cmd_repair_discussion_mapping(c, con, type('Args', (), {'count': 1, 'wait_seconds': 0, 'update_timeout': 0})())
-        finally:
-            poster.tg_request = orig
-
-        self.assertEqual(rc, 0)
-        self.assertEqual(payloads[0]['timeout'], 0)
-
-    def test_repair_discussion_mapping_uses_one_updates_snapshot_for_many_rows(self):
+    def test_repair_discussion_mapping_uses_one_cached_updates_snapshot_for_many_rows(self):
         con = poster.init_db(Path(':memory:'))
         c = cfg()
         c.dry_run = False
@@ -1429,22 +1403,65 @@ class DragonflyPosterTests(unittest.TestCase):
                 base_html='base',
                 role='last',
             )
-        calls = []
         updates = [
             {'update_id': 20, 'message': {'message_id': 801, 'chat': {'id': -100222}, 'is_automatic_forward': True, 'forward_from_message_id': 601}},
             {'update_id': 21, 'message': {'message_id': 802, 'chat': {'id': -100222}, 'is_automatic_forward': True, 'forward_from_message_id': 602}},
         ]
+        poster.store_telegram_updates(con, updates)
         orig = poster.tg_request
-        poster.tg_request = lambda cfg, method, payload: calls.append((method, payload)) or {'ok': True, 'result': updates}
+        poster.tg_request = lambda cfg, method, payload: (_ for _ in ()).throw(AssertionError('repair must not call getUpdates'))
         try:
             rc = poster.cmd_repair_discussion_mapping(c, con, type('Args', (), {'count': 10, 'wait_seconds': 0, 'update_timeout': 0})())
         finally:
             poster.tg_request = orig
 
         self.assertEqual(rc, 0)
-        self.assertEqual(len(calls), 1)
         rows = con.execute("SELECT post_id, discussion_message_id FROM telegram_discussion_messages ORDER BY post_id").fetchall()
         self.assertEqual(rows, [(911, 801), (912, 802)])
+
+    def test_sync_comments_repairs_cached_discussion_mapping_before_fetching_comments(self):
+        con = poster.init_db(Path(':memory:'))
+        c = cfg()
+        c.dry_run = False
+        c.telegram_token = 'tg'
+        c.discussion_chat_id = '-100222'
+        poster.record_telegram_message(
+            con,
+            post(post_id=913),
+            chat_id='@channel',
+            message_id=603,
+            message_kind='text',
+            base_html='base',
+            role='last',
+        )
+        poster.store_telegram_updates(con, [{
+            'update_id': 30,
+            'message': {
+                'message_id': 803,
+                'chat': {'id': -100222},
+                'is_automatic_forward': True,
+                'forward_from_message_id': 603,
+            },
+        }])
+        calls = []
+        orig_posts = poster.get_recent_posts_for_command
+        orig_fetch = poster.fetch_post_comments
+        orig_tg = poster.tg_request
+        poster.get_recent_posts_for_command = lambda cfg, con, args: [post(post_id=913, comments_count=1)]
+        poster.fetch_post_comments = lambda cfg, pid: [{'id': 42, 'username': 'Bob', 'text': 'new', 'created_at': '2026-07-21T10:01:00', 'likes_count': 0}]
+        poster.tg_request = lambda cfg, method, payload: calls.append((method, payload)) or {'ok': True, 'result': {'message_id': 904}}
+        try:
+            rc = poster.cmd_sync_comments(c, con, type('Args', (), {'count': 1, 'offset': 0, 'hot_count': 20, 'send_existing': True, 'use_feed_cache': True})())
+        finally:
+            poster.get_recent_posts_for_command = orig_posts
+            poster.fetch_post_comments = orig_fetch
+            poster.tg_request = orig_tg
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls[0][0], 'sendMessage')
+        self.assertEqual(calls[0][1]['reply_to_message_id'], 803)
+        row = con.execute("SELECT discussion_message_id FROM telegram_discussion_messages WHERE post_id=913 AND role='last'").fetchone()
+        self.assertEqual(row, (803,))
 
     def test_sync_comments_seeds_existing_then_sends_new_comment(self):
         con = poster.init_db(Path(':memory:'))
