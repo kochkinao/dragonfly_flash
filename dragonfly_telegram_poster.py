@@ -2199,6 +2199,12 @@ def tg_request(cfg: Config, method: str, payload: dict[str, Any]) -> dict[str, A
             retry = 0
         if e.code == 429 and retry > 0:
             sleep_for = retry + 2
+            if method == "sendMediaGroup":
+                log(
+                    f"Telegram ambiguous flood wait: method={method} chat_id={payload.get('chat_id')} retry_after={sleep_for}s; not retrying media group to avoid duplicates",
+                    logging.WARNING,
+                )
+                raise RuntimeError(f"Telegram ambiguous sendMediaGroup 429 retry_after={sleep_for}s: {raw[:1000]}") from e
             log(f"Telegram flood wait: method={method} chat_id={payload.get('chat_id')} sleeping {sleep_for}s", logging.WARNING)
             time.sleep(sleep_for)
             return tg_request(cfg, method, payload)
@@ -2250,6 +2256,12 @@ def tg_multipart_request(cfg: Config, method: str, fields: dict[str, str], files
             retry = 0
         if e.code == 429 and retry > 0:
             sleep_for = retry + 2
+            if method == "sendMediaGroup":
+                log(
+                    f"Telegram ambiguous flood wait: multipart method={method} chat_id={fields.get('chat_id')} retry_after={sleep_for}s; not retrying media group to avoid duplicates",
+                    logging.WARNING,
+                )
+                raise RuntimeError(f"Telegram ambiguous sendMediaGroup 429 retry_after={sleep_for}s: {raw[:1000]}") from e
             log(f"Telegram flood wait: multipart method={method} chat_id={fields.get('chat_id')} sleeping {sleep_for}s", logging.WARNING)
             time.sleep(sleep_for)
             return tg_multipart_request(cfg, method, fields, files)

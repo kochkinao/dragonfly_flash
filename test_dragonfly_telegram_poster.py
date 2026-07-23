@@ -340,6 +340,35 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertEqual(calls['sleeps'], [5])
         self.assertEqual(calls['alerts'], 0)
 
+    def test_telegram_send_media_group_429_does_not_retry_ambiguous_album_send(self):
+        c = cfg()
+        c.dry_run = False
+        c.telegram_token = 'tg'
+        c.telegram_chat_id = '@channel'
+        calls = {'urlopen': 0, 'sleeps': []}
+
+        class FakeHeaders:
+            pass
+
+        def fake_urlopen(req, timeout=60):
+            calls['urlopen'] += 1
+            body = b'{"ok": false, "error_code": 429, "parameters": {"retry_after": 3}}'
+            raise poster.urllib.error.HTTPError(req.full_url, 429, 'Too Many Requests', FakeHeaders(), __import__('io').BytesIO(body))
+
+        orig_urlopen = poster.urllib.request.urlopen
+        orig_sleep = poster.time.sleep
+        poster.urllib.request.urlopen = fake_urlopen
+        poster.time.sleep = lambda seconds: calls['sleeps'].append(seconds)
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'ambiguous'):
+                poster.tg_request(c, 'sendMediaGroup', {'chat_id': '@channel', 'media': [{'type': 'photo', 'media': 'https://x.test/a.jpg'}]})
+        finally:
+            poster.urllib.request.urlopen = orig_urlopen
+            poster.time.sleep = orig_sleep
+
+        self.assertEqual(calls['urlopen'], 1)
+        self.assertEqual(calls['sleeps'], [])
+
     def test_telegram_multipart_429_retries_without_dm_alert_spam(self):
         c = cfg()
         c.dry_run = False
