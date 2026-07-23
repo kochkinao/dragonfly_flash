@@ -296,6 +296,99 @@ class DragonflyPosterTests(unittest.TestCase):
         self.assertEqual(poster.kv_get(con, 'telegram_admin_updates_offset'), '52')
         self.assertTrue(any(method == 'sendMessage' and 'reply_markup' in payload for method, payload in calls))
 
+    def test_telegram_429_retries_without_dm_alert_spam(self):
+        c = cfg()
+        c.dry_run = False
+        c.telegram_token = 'tg'
+        c.telegram_chat_id = '@channel'
+        c.alert_chat_id = '498975827'
+        calls = {'urlopen': 0, 'alerts': 0, 'sleeps': []}
+
+        class FakeHeaders:
+            pass
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+            def read(self):
+                return b'{"ok": true, "result": {"message_id": 1}}'
+
+        def fake_urlopen(req, timeout=60):
+            calls['urlopen'] += 1
+            if calls['urlopen'] == 1:
+                body = b'{"ok": false, "error_code": 429, "parameters": {"retry_after": 3}}'
+                raise poster.urllib.error.HTTPError(req.full_url, 429, 'Too Many Requests', FakeHeaders(), __import__('io').BytesIO(body))
+            return FakeResp()
+
+        orig_urlopen = poster.urllib.request.urlopen
+        orig_sleep = poster.time.sleep
+        orig_alert = poster.send_alert
+        poster.urllib.request.urlopen = fake_urlopen
+        poster.time.sleep = lambda seconds: calls['sleeps'].append(seconds)
+        poster.send_alert = lambda *args, **kwargs: calls.__setitem__('alerts', calls['alerts'] + 1)
+        try:
+            resp = poster.tg_request(c, 'editMessageCaption', {'chat_id': '@channel', 'message_id': 1, 'caption': 'x'})
+        finally:
+            poster.urllib.request.urlopen = orig_urlopen
+            poster.time.sleep = orig_sleep
+            poster.send_alert = orig_alert
+
+        self.assertTrue(resp['ok'])
+        self.assertEqual(calls['urlopen'], 2)
+        self.assertEqual(calls['sleeps'], [5])
+        self.assertEqual(calls['alerts'], 0)
+
+    def test_telegram_multipart_429_retries_without_dm_alert_spam(self):
+        c = cfg()
+        c.dry_run = False
+        c.telegram_token = 'tg'
+        c.telegram_chat_id = '@channel'
+        c.alert_chat_id = '498975827'
+        calls = {'urlopen': 0, 'alerts': 0, 'sleeps': []}
+
+        class FakeHeaders:
+            pass
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+            def read(self):
+                return b'{"ok": true, "result": {"message_id": 2}}'
+
+        def fake_urlopen(req, timeout=120):
+            calls['urlopen'] += 1
+            if calls['urlopen'] == 1:
+                body = b'{"ok": false, "error_code": 429, "parameters": {"retry_after": 4}}'
+                raise poster.urllib.error.HTTPError(req.full_url, 429, 'Too Many Requests', FakeHeaders(), __import__('io').BytesIO(body))
+            return FakeResp()
+
+        orig_urlopen = poster.urllib.request.urlopen
+        orig_sleep = poster.time.sleep
+        orig_alert = poster.send_alert
+        poster.urllib.request.urlopen = fake_urlopen
+        poster.time.sleep = lambda seconds: calls['sleeps'].append(seconds)
+        poster.send_alert = lambda *args, **kwargs: calls.__setitem__('alerts', calls['alerts'] + 1)
+        try:
+            resp = poster.tg_multipart_request(
+                c,
+                'sendPhoto',
+                {'chat_id': '@channel', 'caption': 'x'},
+                {'photo': ('x.jpg', b'123', 'image/jpeg')},
+            )
+        finally:
+            poster.urllib.request.urlopen = orig_urlopen
+            poster.time.sleep = orig_sleep
+            poster.send_alert = orig_alert
+
+        self.assertTrue(resp['ok'])
+        self.assertEqual(calls['urlopen'], 2)
+        self.assertEqual(calls['sleeps'], [6])
+        self.assertEqual(calls['alerts'], 0)
+
     def test_admin_watch_polls_telegram_and_processes_cached_admin_updates(self):
         con = poster.init_db(Path(':memory:'))
         c = cfg()

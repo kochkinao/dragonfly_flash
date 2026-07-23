@@ -2120,14 +2120,7 @@ def tg_request(cfg: Config, method: str, payload: dict[str, Any]) -> dict[str, A
             retry = 0
         if e.code == 429 and retry > 0:
             sleep_for = retry + 2
-            log(f"Telegram flood wait: sleeping {sleep_for}s")
-            if str(payload.get("chat_id")) != str(cfg.alert_chat_id):
-                send_alert(
-                    cfg,
-                    "Telegram попросил притормозить",
-                    f"Получили 429 от Telegram. Жду {human_duration(sleep_for)} и продолжаю отправку. Метод: {method}.",
-                    level="warning",
-                )
+            log(f"Telegram flood wait: method={method} chat_id={payload.get('chat_id')} sleeping {sleep_for}s", logging.WARNING)
             time.sleep(sleep_for)
             return tg_request(cfg, method, payload)
         raise RuntimeError(f"Telegram HTTP {e.code}: {raw[:1000]}") from e
@@ -2178,14 +2171,7 @@ def tg_multipart_request(cfg: Config, method: str, fields: dict[str, str], files
             retry = 0
         if e.code == 429 and retry > 0:
             sleep_for = retry + 2
-            log(f"Telegram flood wait: sleeping {sleep_for}s")
-            if str(fields.get("chat_id")) != str(cfg.alert_chat_id):
-                send_alert(
-                    cfg,
-                    "Telegram попросил притормозить",
-                    f"Получили 429 от Telegram. Жду {human_duration(sleep_for)} и продолжаю отправку медиа. Метод: {method}.",
-                    level="warning",
-                )
+            log(f"Telegram flood wait: multipart method={method} chat_id={fields.get('chat_id')} sleeping {sleep_for}s", logging.WARNING)
             time.sleep(sleep_for)
             return tg_multipart_request(cfg, method, fields, files)
         raise RuntimeError(f"Telegram HTTP {e.code}: {raw[:1000]}") from e
