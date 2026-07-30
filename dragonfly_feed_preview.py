@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-BASE_URL = "https://dragonfly-flash.ru"
+BASE_URL = "https://dragonfly-flash.com"
 FEED_URL = BASE_URL + "/api/feed?type={type}&limit={limit}&offset=0"
 DEFAULT_STATE = Path.home() / ".hermes" / "state" / "dragonfly_feed_seen.json"
 

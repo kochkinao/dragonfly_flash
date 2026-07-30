@@ -2,7 +2,7 @@
 """Upload audio tracks to Dragonfly Flash.
 
 Endpoint discovered from the browser app:
-  POST https://dragonfly-flash.ru/api/audio/upload
+  POST https://dragonfly-flash.com/api/audio/upload
   multipart/form-data fields: artist, title, file
 
 The script is server-friendly: reads secrets from env/.env, supports the same
@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-BASE_URL = "https://dragonfly-flash.ru"
+BASE_URL = "https://dragonfly-flash.com"
 UPLOAD_URL = BASE_URL + "/api/audio/upload"
 DEFAULT_MAX_BYTES = 25 * 1024 * 1024
 DEFAULT_ACCOUNTS_FILE = "/home/wacotal/.hermes/state/dragonfly_accounts.json"

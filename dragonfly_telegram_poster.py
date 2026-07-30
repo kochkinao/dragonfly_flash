@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-BASE_URL = "https://dragonfly-flash.ru"
+BASE_URL = "https://dragonfly-flash.com"
 API_FEED = BASE_URL + "/api/feed?type={feed_type}&limit={limit}&offset={offset}"
 API_POST = BASE_URL + "/api/post/{post_id}"
 API_COMMENTS = BASE_URL + "/api/get_comments/{post_id}?user_id={user_id}"

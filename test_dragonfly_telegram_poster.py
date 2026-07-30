@@ -495,12 +495,12 @@ class DragonflyPosterTests(unittest.TestCase):
             },
         )
         self.assertTrue(poster.is_publishable(rp))
-        self.assertEqual(poster.photo_urls(rp), ['https://dragonfly-flash.ru/photousers/x.png'])
+        self.assertEqual(poster.photo_urls(rp), ['https://dragonfly-flash.com/photousers/x.png'])
         html = poster.format_html(rp)
         self.assertIn('🔄 Репост', html)
         self.assertIn('литературный клуб', html)
         self.assertIn('Текст из паблика', html)
-        self.assertIn('https://dragonfly-flash.ru/?community=myeyes', html)
+        self.assertIn('https://dragonfly-flash.com/?community=myeyes', html)
         self.assertNotIn('🔄 репост', html)
 
     def test_poll_only_post_is_publishable_and_renders_results(self):
@@ -524,7 +524,7 @@ class DragonflyPosterTests(unittest.TestCase):
 
     def test_community_author_link_keeps_query_url(self):
         community_post = post(author_link='?community=myeyes')
-        self.assertEqual(poster.profile_url(community_post), 'https://dragonfly-flash.ru/?community=myeyes')
+        self.assertEqual(poster.profile_url(community_post), 'https://dragonfly-flash.com/?community=myeyes')
 
     def test_best_likes_threshold_is_runtime_int_setting_in_panel(self):
         con = poster.init_db(Path(':memory:'))
@@ -1076,7 +1076,7 @@ class DragonflyPosterTests(unittest.TestCase):
         poster.urllib.request.urlopen = fake_urlopen
         poster.time.sleep = lambda s: sleeps.append(s)
         try:
-            filename, data, ctype = poster.download_media_bytes('https://dragonfly-flash.ru/photousers/x.jpg', retries=1)
+            filename, data, ctype = poster.download_media_bytes('https://dragonfly-flash.com/photousers/x.jpg', retries=1)
         finally:
             poster.urllib.request.urlopen = orig_urlopen
             poster.time.sleep = orig_sleep
@@ -1090,7 +1090,7 @@ class DragonflyPosterTests(unittest.TestCase):
     def test_header_has_linked_author_and_datetime_with_light_emoji(self):
         chunks = poster.format_html_chunks(post(description='hello'), limit=poster.MAX_TG_MESSAGE)
 
-        self.assertIn('👤 <a href="https://dragonfly-flash.ru/?id=alice_profile">Alice &lt;A&gt;</a>', chunks[0])
+        self.assertIn('👤 <a href="https://dragonfly-flash.com/?id=alice_profile">Alice &lt;A&gt;</a>', chunks[0])
         self.assertIn('🕒 <i>20.07.2026 12:00</i>', chunks[0])
 
     def test_text_keeps_apostrophes_and_combining_symbols_but_escapes_html(self):
@@ -1159,7 +1159,7 @@ class DragonflyPosterTests(unittest.TestCase):
             return {'ok': True, 'result': {'message_id': 801}}
         poster.tg_multipart_request = fake_multipart
         try:
-            resp = poster.send_one_media(c, 'https://dragonfly-flash.ru/photousers/large.jpg', caption='caption')
+            resp = poster.send_one_media(c, 'https://dragonfly-flash.com/photousers/large.jpg', caption='caption')
         finally:
             poster.download_media_bytes = orig_download
             poster.tg_multipart_request = orig_multipart
@@ -1181,13 +1181,13 @@ class DragonflyPosterTests(unittest.TestCase):
             return {'ok': True, 'result': {'message_id': 802}}
         poster.tg_request = fake_tg_request
         try:
-            resp = poster.send_one_media(c, 'https://dragonfly-flash.ru/photousers/large.jpg', caption='caption')
+            resp = poster.send_one_media(c, 'https://dragonfly-flash.com/photousers/large.jpg', caption='caption')
         finally:
             poster.tg_request = orig
 
         self.assertEqual(resp['result']['message_id'], 802)
         self.assertEqual([m for m, _ in calls], ['sendPhoto', 'sendDocument'])
-        self.assertEqual(calls[1][1]['document'], 'https://dragonfly-flash.ru/photousers/large.jpg')
+        self.assertEqual(calls[1][1]['document'], 'https://dragonfly-flash.com/photousers/large.jpg')
         self.assertEqual(calls[1][1]['caption'], 'caption')
 
     def test_long_text_post_is_split_into_bounded_messages_with_continuation(self):
